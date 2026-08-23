@@ -1,19 +1,15 @@
 """
 audio_engine.py
 Real-time audio engine: captures your real mic, runs it through the
-EffectChain, mixes in any playing soundboard clips (with their own
-volume/deep fry controls), and streams the result out to the virtual
-cable device.
+EffectChain, mixes in any playing soundboard clips, and streams the result
+out to the virtual cable device.
 
-Uses two independent streams (InputStream + OutputStream) linked by a
-thread-safe queue, since Windows won't allow one combined duplex stream
-across two different devices/host APIs (real mic + VB-Cable).
-
-Because the mic and the virtual cable are separate devices, they run on
-independent hardware clocks. Even at the "same" 48000Hz sample rate, tiny
-clock drift between them causes the buffer to slowly overflow or run dry
-over a few seconds -> crackling / pitch wobble. We keep the queue depth
-near a target watermark to compensate for this drift.
+IMPORTANT: instead of forcing a fixed 48000Hz sample rate on both devices,
+we query each device's own native/default sample rate at start time and
+use that. Forcing a rate that doesn't match a device's actual configured
+rate makes Windows silently resample on the fly, which is a very common
+cause of "warbly"/wobbly-pitch audio artifacts, present from the very
+first second of playback (not something that builds up over time).
 """
 
 import sounddevice as sd
@@ -24,9 +20,9 @@ import queue
 from effects import EffectChain, GainEffect, DeepFryEffect
 from soundboard import SoundboardPlayer
 
-SAMPLE_RATE = 48000
 BLOCK_SIZE = 1024
 CHANNELS = 2
+DEFAULT_SAMPLE_RATE = 48000  # fallback only, real rate is queried per device
 
 TARGET_QUEUE_DEPTH = 4
 MAX_QUEUE_DEPTH = 10
@@ -44,7 +40,10 @@ class AudioEngine:
         self.soundboard_gain = GainEffect(enabled=True, gain_db=0.0)
         self.soundboard_deep_fry = DeepFryEffect(enabled=False)
 
-        self.soundboard = SoundboardPlayer(samplerate=SAMPLE_RATE, channels=CHANNELS)
+        self.input_rate = DEFAULT_SAMPLE_RATE
+        self.output_rate = DEFAULT_SAMPLE_RATE
+
+        self.soundboard = SoundboardPlayer(samplerate=DEFAULT_SAMPLE_RATE, channels=CHANNELS)
 
         self._input_stream = None
         self._output_stream = None
@@ -78,12 +77,23 @@ class AudioEngine:
                 return d["index"]
         return None
 
+    @staticmethod
+    def _get_device_default_rate(device_index, fallback=DEFAULT_SAMPLE_RATE):
+        try:
+            info = sd.query_devices(device_index)
+            rate = info.get("default_samplerate")
+            if rate and rate > 0:
+                return int(round(rate))
+        except Exception:
+            pass
+        return fallback
+
     def _input_callback(self, indata, frames, time_info, status):
         with self._lock:
             mic_signal = indata.copy()
             if mic_signal.shape[1] == 1 and CHANNELS == 2:
                 mic_signal = np.repeat(mic_signal, 2, axis=1)
-            processed = self.chain.process(mic_signal, SAMPLE_RATE)
+            processed = self.chain.process(mic_signal, self.input_rate)
 
         while self._buffer.qsize() > TARGET_QUEUE_DEPTH:
             try:
@@ -116,16 +126,41 @@ class AudioEngine:
         sb_block = self.soundboard.read_block(frames)
 
         with self._lock:
-            sb_block = self.soundboard_gain.process(sb_block, SAMPLE_RATE)
+            sb_block = self.soundboard_gain.process(sb_block, self.output_rate)
             if self.soundboard_deep_fry.enabled:
-                sb_block = self.soundboard_deep_fry.process(sb_block, SAMPLE_RATE)
+                sb_block = self.soundboard_deep_fry.process(sb_block, self.output_rate)
 
-        mixed = np.clip(block + sb_block, -1.0, 1.0)
+        mixed = block + sb_block
+        mixed = self._soft_limit(mixed)
         outdata[:] = mixed
+
+    @staticmethod
+    def _soft_limit(x: np.ndarray, threshold: float = 0.8) -> np.ndarray:
+        """Soft-knee limiter: below threshold passes untouched, anything
+        above gets smoothly compressed toward +/-1.0 instead of being
+        hard-clipped (hard clipping sounds crunchy/distorted)."""
+        out = np.copy(x)
+        over_mask = np.abs(x) > threshold
+        if np.any(over_mask):
+            sign = np.sign(x[over_mask])
+            excess = np.abs(x[over_mask]) - threshold
+            compressed = threshold + (1.0 - threshold) * np.tanh(excess / (1.0 - threshold))
+            out[over_mask] = sign * compressed
+        return np.clip(out, -1.0, 1.0)
 
     def start(self):
         if self._running:
             return
+
+        # Query each device's own native rate instead of forcing 48000.
+        # Mismatched forced rates cause Windows to resample on the fly,
+        # which is the classic cause of "warbly" pitch artifacts.
+        self.input_rate = self._get_device_default_rate(self.mic_device)
+        self.output_rate = self._get_device_default_rate(self.output_device)
+
+        # Soundboard must decode/render at the OUTPUT stream's actual rate
+        # since that's the stream it gets mixed into.
+        self.soundboard = SoundboardPlayer(samplerate=self.output_rate, channels=CHANNELS)
 
         while not self._buffer.empty():
             try:
@@ -137,7 +172,7 @@ class AudioEngine:
         self._input_stream = sd.InputStream(
             device=self.mic_device,
             channels=CHANNELS,
-            samplerate=SAMPLE_RATE,
+            samplerate=self.input_rate,
             blocksize=BLOCK_SIZE,
             dtype="float32",
             callback=self._input_callback,
@@ -145,7 +180,7 @@ class AudioEngine:
         self._output_stream = sd.OutputStream(
             device=self.output_device,
             channels=CHANNELS,
-            samplerate=SAMPLE_RATE,
+            samplerate=self.output_rate,
             blocksize=BLOCK_SIZE,
             dtype="float32",
             callback=self._output_callback,
