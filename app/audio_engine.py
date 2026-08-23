@@ -4,24 +4,17 @@ Real-time audio engine: captures your real mic, runs it through the
 EffectChain, mixes in any playing soundboard clips, and streams the result
 out to the virtual cable device.
 
-WHY THIS VERSION IS DIFFERENT:
-Your mic and the virtual cable are two separate devices with independent
-hardware clocks. Even at the "same" nominal sample rate, they drift apart
-over time. Correcting that drift by dropping/repeating whole blocks (the
-previous approach) causes small audible glitches every time it happens --
-which is exactly what sounds like "warble" when it happens repeatedly.
-
-This version uses an ElasticBuffer: a small adaptive buffer that gently
-speeds up or slows down playback by a tiny, inaudible amount (well under
-1%) using linear-interpolation resampling to keep itself at a healthy
-fill level. This is the same category of technique real-time voice apps
-use internally to bridge two independently clocked audio devices smoothly.
+Uses an ElasticBuffer to bridge the mic input stream and the virtual cable
+output stream, since they run on independent hardware clocks that drift
+over time. The soundboard decodes/resamples MP3s using a proper high
+quality resampler (see soundboard.py) matched to the ACTUAL stream sample
+rate sounddevice reports after opening the stream (not just the device's
+reported "default" rate, which can occasionally differ slightly).
 """
 
 import sounddevice as sd
 import numpy as np
 import threading
-import queue
 
 from effects import EffectChain, GainEffect, DeepFryEffect
 from soundboard import SoundboardPlayer
@@ -30,8 +23,8 @@ BLOCK_SIZE = 1024
 DEFAULT_SAMPLE_RATE = 48000
 DEFAULT_CHANNELS = 2
 
-TARGET_LATENCY_SEC = 0.12   # buffer aims to hold ~120ms of audio
-MAX_LATENCY_SEC = 0.6       # hard cap before we drop old audio (avoid runaway lag)
+TARGET_LATENCY_SEC = 0.12
+MAX_LATENCY_SEC = 0.6
 
 
 def _get_wasapi_hostapi_index():
@@ -43,10 +36,9 @@ def _get_wasapi_hostapi_index():
 
 class ElasticBuffer:
     """Thread-safe adaptive buffer that bridges two independently-clocked
-    audio streams. Written to by the input callback, read from by the
-    output callback. Automatically speeds up/slows down playback by a
-    small, inaudible ratio to correct for clock drift instead of abruptly
-    dropping or repeating whole blocks."""
+    audio streams by gently speeding up/slowing down playback (a tiny,
+    inaudible ratio) via linear-interpolation resampling, instead of
+    abruptly dropping or repeating whole blocks."""
 
     def __init__(self, channels: int, samplerate: int):
         self.channels = channels
@@ -203,19 +195,16 @@ class AudioEngine:
         mic_info = self._get_device_info(self.mic_device)
         out_info = self._get_device_info(self.output_device)
 
-        self.input_rate = int(round(mic_info.get("default_samplerate", DEFAULT_SAMPLE_RATE)))
-        self.output_rate = int(round(out_info.get("default_samplerate", DEFAULT_SAMPLE_RATE)))
+        requested_input_rate = int(round(mic_info.get("default_samplerate", DEFAULT_SAMPLE_RATE)))
+        requested_output_rate = int(round(out_info.get("default_samplerate", DEFAULT_SAMPLE_RATE)))
 
         self.input_channels = max(1, min(2, mic_info.get("max_input_channels", 1)))
         self.output_channels = max(1, min(2, out_info.get("max_output_channels", 2)))
 
-        self.soundboard = SoundboardPlayer(samplerate=self.output_rate, channels=self.output_channels)
-        self._elastic = ElasticBuffer(channels=self.output_channels, samplerate=self.output_rate)
-
         self._input_stream = sd.InputStream(
             device=self.mic_device,
             channels=self.input_channels,
-            samplerate=self.input_rate,
+            samplerate=requested_input_rate,
             blocksize=BLOCK_SIZE,
             dtype="float32",
             callback=self._input_callback,
@@ -223,11 +212,17 @@ class AudioEngine:
         self._output_stream = sd.OutputStream(
             device=self.output_device,
             channels=self.output_channels,
-            samplerate=self.output_rate,
+            samplerate=requested_output_rate,
             blocksize=BLOCK_SIZE,
             dtype="float32",
             callback=self._output_callback,
         )
+
+        self.input_rate = int(round(self._input_stream.samplerate))
+        self.output_rate = int(round(self._output_stream.samplerate))
+
+        self.soundboard = SoundboardPlayer(samplerate=self.output_rate, channels=self.output_channels)
+        self._elastic = ElasticBuffer(channels=self.output_channels, samplerate=self.output_rate)
 
         self._input_stream.start()
         self._output_stream.start()
