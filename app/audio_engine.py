@@ -3,11 +3,18 @@ audio_engine.py
 Real-time audio engine: captures your real mic, runs it through the
 EffectChain, mixes in any playing soundboard clips, and streams the result
 out to the virtual cable device.
+
+NOTE: Windows will not allow opening one single duplex sd.Stream() that
+combines two different devices/host APIs (real mic + VB-Cable). Doing so
+throws PaErrorCode -9993 "Illegal combination of I/O devices". The fix is
+to run two independent streams (InputStream + OutputStream) linked by a
+small thread-safe queue.
 """
 
 import sounddevice as sd
 import numpy as np
 import threading
+import queue
 
 from effects import EffectChain
 from soundboard import SoundboardPlayer
@@ -27,9 +34,11 @@ class AudioEngine:
         self.chain = EffectChain()
         self.soundboard = SoundboardPlayer(samplerate=SAMPLE_RATE, channels=CHANNELS)
 
-        self._stream = None
+        self._input_stream = None
+        self._output_stream = None
         self._lock = threading.Lock()
         self._running = False
+        self._buffer = queue.Queue(maxsize=20)
 
     @staticmethod
     def list_input_devices():
@@ -56,42 +65,75 @@ class AudioEngine:
                 return d["index"]
         return None
 
+    def _input_callback(self, indata, frames, time_info, status):
+        with self._lock:
+            mic_signal = indata.copy()
+            if mic_signal.shape[1] == 1 and CHANNELS == 2:
+                mic_signal = np.repeat(mic_signal, 2, axis=1)
+            processed = self.chain.process(mic_signal, SAMPLE_RATE)
+
+        try:
+            self._buffer.put_nowait(processed)
+        except queue.Full:
+            try:
+                self._buffer.get_nowait()  # drop oldest to stay realtime
+                self._buffer.put_nowait(processed)
+            except queue.Empty:
+                pass
+
+    def _output_callback(self, outdata, frames, time_info, status):
+        try:
+            block = self._buffer.get_nowait()
+        except queue.Empty:
+            block = np.zeros((frames, CHANNELS), dtype=np.float32)
+
+        if block.shape[0] != frames:
+            fixed = np.zeros((frames, CHANNELS), dtype=np.float32)
+            n = min(frames, block.shape[0])
+            fixed[:n] = block[:n]
+            block = fixed
+
+        sb_block = self.soundboard.read_block(frames)
+        mixed = np.clip(block + sb_block, -1.0, 1.0)
+        outdata[:] = mixed
+
     def start(self):
         if self._running:
             return
 
-        def callback(indata, outdata, frames, time_info, status):
-            if status:
-                pass
+        with self._buffer.mutex if hasattr(self._buffer, "mutex") else threading.Lock():
+            pass  # no-op, queue.Queue has its own locking
 
-            with self._lock:
-                mic_signal = indata.copy()
-                if mic_signal.shape[1] == 1 and CHANNELS == 2:
-                    mic_signal = np.repeat(mic_signal, 2, axis=1)
-
-                processed = self.chain.process(mic_signal, SAMPLE_RATE)
-
-                sb_block = self.soundboard.read_block(frames)
-                mixed = np.clip(processed + sb_block, -1.0, 1.0)
-
-                outdata[:] = mixed
-
-        self._stream = sd.Stream(
+        self._input_stream = sd.InputStream(
+            device=self.mic_device,
+            channels=CHANNELS,
             samplerate=SAMPLE_RATE,
             blocksize=BLOCK_SIZE,
             dtype="float32",
-            channels=CHANNELS,
-            device=(self.mic_device, self.output_device),
-            callback=callback,
+            callback=self._input_callback,
         )
-        self._stream.start()
+        self._output_stream = sd.OutputStream(
+            device=self.output_device,
+            channels=CHANNELS,
+            samplerate=SAMPLE_RATE,
+            blocksize=BLOCK_SIZE,
+            dtype="float32",
+            callback=self._output_callback,
+        )
+
+        self._input_stream.start()
+        self._output_stream.start()
         self._running = True
 
     def stop(self):
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        if self._input_stream is not None:
+            self._input_stream.stop()
+            self._input_stream.close()
+            self._input_stream = None
+        if self._output_stream is not None:
+            self._output_stream.stop()
+            self._output_stream.close()
+            self._output_stream = None
         self._running = False
 
     def is_running(self):
