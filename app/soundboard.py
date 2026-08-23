@@ -2,6 +2,10 @@
 soundboard.py
 Manages loading mp3s into numpy arrays and playing them mixed into the
 outgoing audio stream. Uses pydub to decode mp3 -> PCM.
+
+Playback is tracked per sound_id so that pressing Play again on a sound
+that's already playing RESTARTS it instead of stacking a second overlapping
+copy (which caused phasing/comb-filter artifacts over time).
 """
 
 import numpy as np
@@ -36,14 +40,25 @@ class SoundboardPlayer:
         self._cache[key] = samples
         return samples
 
-    def play(self, filepath: Path, volume: float = 1.0):
+    def play(self, filepath: Path, volume: float = 1.0, sound_id: str = None):
         audio = self._decode(filepath)
         with self._lock:
-            self._active_clips.append({"audio": audio, "pos": 0, "volume": volume})
+            if sound_id is not None:
+                self._active_clips = [c for c in self._active_clips if c["id"] != sound_id]
+            self._active_clips.append({
+                "id": sound_id,
+                "audio": audio,
+                "pos": 0,
+                "volume": volume
+            })
 
     def stop_all(self):
         with self._lock:
             self._active_clips.clear()
+
+    def stop_sound(self, sound_id: str):
+        with self._lock:
+            self._active_clips = [c for c in self._active_clips if c["id"] != sound_id]
 
     def is_playing(self) -> bool:
         with self._lock:
