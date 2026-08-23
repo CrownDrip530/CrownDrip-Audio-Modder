@@ -60,7 +60,6 @@ class MainWindow(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         root_layout.addWidget(title)
 
-        # ---- Device panel ----
         device_panel = self._make_panel()
         dp_layout = QVBoxLayout(device_panel)
         dp_layout.addWidget(self._section_label("Devices"))
@@ -86,7 +85,6 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(device_panel)
 
-        # ---- Mic control panel ----
         mic_panel = self._make_panel()
         mp_layout = QVBoxLayout(mic_panel)
         mp_layout.addWidget(self._section_label("Mic Controls"))
@@ -115,7 +113,6 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(mic_panel)
 
-        # ---- Soundboard panel ----
         sb_panel = self._make_panel()
         sb_layout = QVBoxLayout(sb_panel)
         sb_layout.addWidget(self._section_label("Soundboard"))
@@ -174,8 +171,6 @@ class MainWindow(QMainWindow):
         lbl = QLabel(text)
         lbl.setObjectName("SectionTitle")
         return lbl
-
-    # ---------------- config wiring ----------------
 
     def _apply_loaded_config(self):
         mic_gain = int(self.config.get("mic_gain_db", 0.0))
@@ -237,8 +232,6 @@ class MainWindow(QMainWindow):
         self.config["output_device"] = self.output_combo.currentText()
         self.config.update(self.engine.to_config_dict())
         cfg.save_config(self.config)
-
-    # ---------------- actions ----------------
 
     def toggle_engine(self):
         if self.engine.is_running():
@@ -307,7 +300,7 @@ class MainWindow(QMainWindow):
             return
         filepath = cfg.get_sound_path(entry)
         try:
-            self.engine.play_sound(filepath, entry.get("volume", 1.0))
+            self.engine.play_sound(filepath, entry.get("volume", 1.0), sound_id=entry["id"])
             self.status.showMessage(f"Playing: {entry['name']}")
         except Exception as e:
             QMessageBox.critical(self, "Playback error", str(e))
