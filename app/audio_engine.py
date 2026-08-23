@@ -8,6 +8,12 @@ cable device.
 Uses two independent streams (InputStream + OutputStream) linked by a
 thread-safe queue, since Windows won't allow one combined duplex stream
 across two different devices/host APIs (real mic + VB-Cable).
+
+Because the mic and the virtual cable are separate devices, they run on
+independent hardware clocks. Even at the "same" 48000Hz sample rate, tiny
+clock drift between them causes the buffer to slowly overflow or run dry
+over a few seconds -> crackling / pitch wobble. We keep the queue depth
+near a target watermark to compensate for this drift.
 """
 
 import sounddevice as sd
@@ -22,6 +28,9 @@ SAMPLE_RATE = 48000
 BLOCK_SIZE = 1024
 CHANNELS = 2
 
+TARGET_QUEUE_DEPTH = 4
+MAX_QUEUE_DEPTH = 10
+
 
 class AudioEngine:
     def __init__(self, mic_device=None, output_device=None, monitor_device=None):
@@ -30,10 +39,8 @@ class AudioEngine:
         self.monitor_device = monitor_device
         self.monitor_enabled = False
 
-        # mic effect chain (gain + deep fry)
         self.chain = EffectChain()
 
-        # separate soundboard (mp3) effect chain: volume + its own deep fry toggle
         self.soundboard_gain = GainEffect(enabled=True, gain_db=0.0)
         self.soundboard_deep_fry = DeepFryEffect(enabled=False)
 
@@ -43,7 +50,8 @@ class AudioEngine:
         self._output_stream = None
         self._lock = threading.Lock()
         self._running = False
-        self._buffer = queue.Queue(maxsize=20)
+        self._buffer = queue.Queue(maxsize=MAX_QUEUE_DEPTH)
+        self._last_block = np.zeros((BLOCK_SIZE, CHANNELS), dtype=np.float32)
 
     @staticmethod
     def list_input_devices():
@@ -77,6 +85,12 @@ class AudioEngine:
                 mic_signal = np.repeat(mic_signal, 2, axis=1)
             processed = self.chain.process(mic_signal, SAMPLE_RATE)
 
+        while self._buffer.qsize() > TARGET_QUEUE_DEPTH:
+            try:
+                self._buffer.get_nowait()
+            except queue.Empty:
+                break
+
         try:
             self._buffer.put_nowait(processed)
         except queue.Full:
@@ -89,8 +103,9 @@ class AudioEngine:
     def _output_callback(self, outdata, frames, time_info, status):
         try:
             block = self._buffer.get_nowait()
+            self._last_block = block
         except queue.Empty:
-            block = np.zeros((frames, CHANNELS), dtype=np.float32)
+            block = self._last_block
 
         if block.shape[0] != frames:
             fixed = np.zeros((frames, CHANNELS), dtype=np.float32)
@@ -111,6 +126,13 @@ class AudioEngine:
     def start(self):
         if self._running:
             return
+
+        while not self._buffer.empty():
+            try:
+                self._buffer.get_nowait()
+            except queue.Empty:
+                break
+        self._last_block = np.zeros((BLOCK_SIZE, CHANNELS), dtype=np.float32)
 
         self._input_stream = sd.InputStream(
             device=self.mic_device,
@@ -147,8 +169,6 @@ class AudioEngine:
     def is_running(self):
         return self._running
 
-    # ---------- mic controls ----------
-
     def set_mic_gain_db(self, gain_db: float):
         with self._lock:
             self.chain.set_mic_gain_db(gain_db)
@@ -160,8 +180,6 @@ class AudioEngine:
     def update_deep_fry_params(self, **kwargs):
         with self._lock:
             self.chain.deep_fry.params.update(kwargs)
-
-    # ---------- soundboard (mp3) controls ----------
 
     def set_soundboard_gain_db(self, gain_db: float):
         with self._lock:
@@ -175,13 +193,14 @@ class AudioEngine:
         with self._lock:
             self.soundboard_deep_fry.params.update(kwargs)
 
-    def play_sound(self, filepath, volume=1.0):
-        self.soundboard.play(filepath, volume)
+    def play_sound(self, filepath, volume=1.0, sound_id=None):
+        self.soundboard.play(filepath, volume, sound_id=sound_id)
+
+    def stop_sound(self, sound_id):
+        self.soundboard.stop_sound(sound_id)
 
     def stop_all_sounds(self):
         self.soundboard.stop_all()
-
-    # ---------- persistence ----------
 
     def to_config_dict(self) -> dict:
         d = self.chain.to_config_dict()
