@@ -24,15 +24,17 @@ DEFAULT_CONFIG = {
     "effects": {
         "deep_fry": {
             "enabled": False,
-            "drive": 8.0,
-            "bitcrush_depth": 6,
-            "eq_boost_db": 10.0
+            "drive": 18.0,
+            "bitcrush_depth": 4,
+            "eq_boost_db": 16.0,
+            "sample_reduction": 3
         },
         "soundboard_deep_fry": {
             "enabled": False,
-            "drive": 8.0,
-            "bitcrush_depth": 6,
-            "eq_boost_db": 10.0
+            "drive": 18.0,
+            "bitcrush_depth": 4,
+            "eq_boost_db": 16.0,
+            "sample_reduction": 3
         }
     },
     "soundboard": []
