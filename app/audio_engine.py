@@ -4,12 +4,13 @@ Real-time audio engine: captures your real mic, runs it through the
 EffectChain, mixes in any playing soundboard clips, and streams the result
 out to the virtual cable device.
 
-IMPORTANT: instead of forcing a fixed 48000Hz sample rate on both devices,
-we query each device's own native/default sample rate at start time and
-use that. Forcing a rate that doesn't match a device's actual configured
-rate makes Windows silently resample on the fly, which is a very common
-cause of "warbly"/wobbly-pitch audio artifacts, present from the very
-first second of playback (not something that builds up over time).
+IMPORTANT: Windows exposes the same physical/virtual device through
+multiple audio host APIs at once (old MME/DirectSound, and modern WASAPI).
+MME is a legacy compatibility layer that does its own internal resampling
+with a lower quality algorithm -- a classic cause of pitch "warble" that
+settles in over the first couple seconds. We restrict device selection to
+WASAPI only, which reports accurate native sample rates and has much
+better real-time timing behavior.
 """
 
 import sounddevice as sd
@@ -22,10 +23,17 @@ from soundboard import SoundboardPlayer
 
 BLOCK_SIZE = 1024
 CHANNELS = 2
-DEFAULT_SAMPLE_RATE = 48000  # fallback only, real rate is queried per device
+DEFAULT_SAMPLE_RATE = 48000
 
 TARGET_QUEUE_DEPTH = 4
 MAX_QUEUE_DEPTH = 10
+
+
+def _get_wasapi_hostapi_index():
+    for i, api in enumerate(sd.query_hostapis()):
+        if "wasapi" in api["name"].lower():
+            return i
+    return None
 
 
 class AudioEngine:
@@ -54,21 +62,29 @@ class AudioEngine:
 
     @staticmethod
     def list_input_devices():
+        """Only lists WASAPI input devices -- avoids picking up legacy
+        MME/DirectSound duplicates that cause resampling artifacts."""
+        wasapi_idx = _get_wasapi_hostapi_index()
         devices = sd.query_devices()
-        return [
-            {"index": i, "name": d["name"]}
-            for i, d in enumerate(devices)
-            if d["max_input_channels"] > 0
-        ]
+        result = []
+        for i, d in enumerate(devices):
+            if d["max_input_channels"] > 0:
+                if wasapi_idx is None or d["hostapi"] == wasapi_idx:
+                    result.append({"index": i, "name": d["name"]})
+        return result
 
     @staticmethod
     def list_output_devices():
+        """Only lists WASAPI output devices -- avoids picking up legacy
+        MME/DirectSound duplicates that cause resampling artifacts."""
+        wasapi_idx = _get_wasapi_hostapi_index()
         devices = sd.query_devices()
-        return [
-            {"index": i, "name": d["name"]}
-            for i, d in enumerate(devices)
-            if d["max_output_channels"] > 0
-        ]
+        result = []
+        for i, d in enumerate(devices):
+            if d["max_output_channels"] > 0:
+                if wasapi_idx is None or d["hostapi"] == wasapi_idx:
+                    result.append({"index": i, "name": d["name"]})
+        return result
 
     @staticmethod
     def find_vb_cable_output_index():
@@ -136,9 +152,6 @@ class AudioEngine:
 
     @staticmethod
     def _soft_limit(x: np.ndarray, threshold: float = 0.8) -> np.ndarray:
-        """Soft-knee limiter: below threshold passes untouched, anything
-        above gets smoothly compressed toward +/-1.0 instead of being
-        hard-clipped (hard clipping sounds crunchy/distorted)."""
         out = np.copy(x)
         over_mask = np.abs(x) > threshold
         if np.any(over_mask):
@@ -152,14 +165,9 @@ class AudioEngine:
         if self._running:
             return
 
-        # Query each device's own native rate instead of forcing 48000.
-        # Mismatched forced rates cause Windows to resample on the fly,
-        # which is the classic cause of "warbly" pitch artifacts.
         self.input_rate = self._get_device_default_rate(self.mic_device)
         self.output_rate = self._get_device_default_rate(self.output_device)
 
-        # Soundboard must decode/render at the OUTPUT stream's actual rate
-        # since that's the stream it gets mixed into.
         self.soundboard = SoundboardPlayer(samplerate=self.output_rate, channels=CHANNELS)
 
         while not self._buffer.empty():
