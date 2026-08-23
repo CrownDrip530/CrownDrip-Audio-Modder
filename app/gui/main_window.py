@@ -25,7 +25,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CrownDrip Audio Modder")
-        self.resize(760, 640)
+        self.resize(780, 720)
 
         self.config = cfg.load_config()
         self.engine = AudioEngine()
@@ -60,6 +60,7 @@ class MainWindow(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         root_layout.addWidget(title)
 
+        # ---- Device panel ----
         device_panel = self._make_panel()
         dp_layout = QVBoxLayout(device_panel)
         dp_layout.addWidget(self._section_label("Devices"))
@@ -85,6 +86,7 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(device_panel)
 
+        # ---- Mic control panel ----
         mic_panel = self._make_panel()
         mp_layout = QVBoxLayout(mic_panel)
         mp_layout.addWidget(self._section_label("Mic Controls"))
@@ -92,8 +94,8 @@ class MainWindow(QMainWindow):
         gain_row = QHBoxLayout()
         gain_row.addWidget(QLabel("Mic Gain (dB):"))
         self.gain_slider = QSlider(Qt.Horizontal)
-        self.gain_slider.setMinimum(-20)
-        self.gain_slider.setMaximum(20)
+        self.gain_slider.setMinimum(-50)
+        self.gain_slider.setMaximum(50)
         self.gain_slider.setValue(0)
         self.gain_slider.valueChanged.connect(self.on_gain_changed)
         gain_row.addWidget(self.gain_slider, 1)
@@ -103,7 +105,7 @@ class MainWindow(QMainWindow):
         mp_layout.addLayout(gain_row)
 
         fry_row = QHBoxLayout()
-        fry_label = QLabel("\U0001F35F Deep Fried Mode:")
+        fry_label = QLabel("\U0001F35F Deep Fried Mode (Mic):")
         fry_row.addWidget(fry_label)
         fry_row.addStretch()
         self.deep_fry_toggle = ToggleSwitch()
@@ -113,9 +115,32 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(mic_panel)
 
+        # ---- Soundboard panel ----
         sb_panel = self._make_panel()
         sb_layout = QVBoxLayout(sb_panel)
         sb_layout.addWidget(self._section_label("Soundboard"))
+
+        sound_gain_row = QHBoxLayout()
+        sound_gain_row.addWidget(QLabel("MP3 Volume (dB):"))
+        self.sound_gain_slider = QSlider(Qt.Horizontal)
+        self.sound_gain_slider.setMinimum(-50)
+        self.sound_gain_slider.setMaximum(50)
+        self.sound_gain_slider.setValue(0)
+        self.sound_gain_slider.valueChanged.connect(self.on_sound_gain_changed)
+        sound_gain_row.addWidget(self.sound_gain_slider, 1)
+        self.sound_gain_value_label = QLabel("0 dB")
+        self.sound_gain_value_label.setFixedWidth(50)
+        sound_gain_row.addWidget(self.sound_gain_value_label)
+        sb_layout.addLayout(sound_gain_row)
+
+        sound_fry_row = QHBoxLayout()
+        sound_fry_label = QLabel("\U0001F35F Deep Fried Mode (MP3):")
+        sound_fry_row.addWidget(sound_fry_label)
+        sound_fry_row.addStretch()
+        self.sound_deep_fry_toggle = ToggleSwitch()
+        self.sound_deep_fry_toggle.toggled.connect(self.on_sound_deep_fry_toggled)
+        sound_fry_row.addWidget(self.sound_deep_fry_toggle)
+        sb_layout.addLayout(sound_fry_row)
 
         self.sound_list = QListWidget()
         self.sound_list.itemDoubleClicked.connect(self.on_play_selected)
@@ -140,25 +165,34 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(sb_panel, 1)
 
-    def _make_panel(self):
+    def _make_panel(self) -> QFrame:
         panel = QFrame()
         panel.setObjectName("Panel")
         return panel
 
-    def _section_label(self, text):
+    def _section_label(self, text: str) -> QLabel:
         lbl = QLabel(text)
         lbl.setObjectName("SectionTitle")
         return lbl
 
+    # ---------------- config wiring ----------------
+
     def _apply_loaded_config(self):
-        self.gain_slider.setValue(int(self.config.get("mic_gain_db", 0.0)))
-        self.gain_value_label.setText(f"{int(self.config.get('mic_gain_db', 0.0))} dB")
+        mic_gain = int(self.config.get("mic_gain_db", 0.0))
+        self.gain_slider.setValue(mic_gain)
+        self.gain_value_label.setText(f"{mic_gain} dB")
+
+        sound_gain = int(self.config.get("soundboard_volume_db", 0.0))
+        self.sound_gain_slider.setValue(sound_gain)
+        self.sound_gain_value_label.setText(f"{sound_gain} dB")
 
         deep_fry_cfg = self.config.get("effects", {}).get("deep_fry", {})
-        is_on = deep_fry_cfg.get("enabled", False)
-        self.deep_fry_toggle.set_checked(is_on, emit=False)
+        self.deep_fry_toggle.set_checked(deep_fry_cfg.get("enabled", False), emit=False)
 
-        self.engine.chain.load_config_dict(self.config)
+        sound_fry_cfg = self.config.get("effects", {}).get("soundboard_deep_fry", {})
+        self.sound_deep_fry_toggle.set_checked(sound_fry_cfg.get("enabled", False), emit=False)
+
+        self.engine.load_config_dict(self.config)
 
         self._refresh_sound_list()
 
@@ -201,8 +235,10 @@ class MainWindow(QMainWindow):
     def _save(self):
         self.config["mic_device"] = self.mic_combo.currentText()
         self.config["output_device"] = self.output_combo.currentText()
-        self.config.update(self.engine.chain.to_config_dict())
+        self.config.update(self.engine.to_config_dict())
         cfg.save_config(self.config)
+
+    # ---------------- actions ----------------
 
     def toggle_engine(self):
         if self.engine.is_running():
@@ -232,7 +268,17 @@ class MainWindow(QMainWindow):
 
     def on_deep_fry_toggled(self, checked):
         self.engine.set_deep_fry_enabled(checked)
-        self.status.showMessage("Deep Fried Mode: ON" if checked else "Deep Fried Mode: OFF")
+        self.status.showMessage("Mic Deep Fried Mode: ON" if checked else "Mic Deep Fried Mode: OFF")
+        self._save()
+
+    def on_sound_gain_changed(self, value):
+        self.sound_gain_value_label.setText(f"{value} dB")
+        self.engine.set_soundboard_gain_db(float(value))
+        self._save()
+
+    def on_sound_deep_fry_toggled(self, checked):
+        self.engine.set_soundboard_deep_fry_enabled(checked)
+        self.status.showMessage("MP3 Deep Fried Mode: ON" if checked else "MP3 Deep Fried Mode: OFF")
         self._save()
 
     def on_add_mp3(self):
