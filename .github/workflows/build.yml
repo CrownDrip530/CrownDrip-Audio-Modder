@@ -1,0 +1,1124 @@
+name: Scaffold and Build CrownDrip Audio Modder
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Scaffold project files (idempotent - only writes if missing)
+        shell: bash
+        run: |
+          mkdir -p app/gui assets
+
+          if [ ! -f requirements.txt ]; then
+          cat > requirements.txt << 'PYEOF'
+          PySide6>=6.6.0
+          sounddevice>=0.4.6
+          numpy>=1.24.0
+          scipy>=1.11.0
+          pydub>=0.25.1
+          PYEOF
+          fi
+
+          if [ ! -f .gitignore ]; then
+          cat > .gitignore << 'PYEOF'
+          __pycache__/
+          *.pyc
+          .venv/
+          venv/
+          build/
+          dist/
+          *.spec
+          .vscode/
+          .idea/
+          PYEOF
+          fi
+
+          if [ ! -f app/main.py ]; then
+          cat > app/main.py << 'PYEOF'
+          """
+          main.py
+          Entry point for CrownDrip Audio Modder.
+          """
+
+          import sys
+          from pathlib import Path
+
+          sys.path.append(str(Path(__file__).resolve().parent))
+
+          from gui.main_window import run
+
+          if __name__ == "__main__":
+              run()
+          PYEOF
+          fi
+
+          if [ ! -f app/config.py ]; then
+          cat > app/config.py << 'PYEOF'
+          """
+          config.py
+          Handles all persistent memory for CrownDrip Audio Modder:
+          - App settings (mic gain, deep fry on/off, selected devices, effect params)
+          - Soundboard library (mp3 file references + custom names)
+
+          Everything lives under %APPDATA%/CrownDripAudioModder/ so it survives
+          closing the app, rebooting, or even deleting the original mp3 you uploaded
+          (we copy it into our own storage folder).
+          """
+
+          import json
+          import os
+          import shutil
+          import uuid
+          from pathlib import Path
+
+          APP_NAME = "CrownDripAudioModder"
+
+          APP_DATA_DIR = Path(os.getenv("APPDATA", Path.home())) / APP_NAME
+          SOUNDS_DIR = APP_DATA_DIR / "sounds"
+          CONFIG_FILE = APP_DATA_DIR / "config.json"
+
+          DEFAULT_CONFIG = {
+              "mic_device": None,
+              "output_device": None,
+              "mic_gain_db": 0.0,
+              "monitor_enabled": False,
+              "effects": {
+                  "deep_fry": {
+                      "enabled": False,
+                      "drive": 8.0,
+                      "bitcrush_depth": 6,
+                      "eq_boost_db": 10.0
+                  }
+              },
+              "soundboard": []
+          }
+
+
+          def _ensure_dirs():
+              APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+              SOUNDS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+          def load_config() -> dict:
+              _ensure_dirs()
+              if not CONFIG_FILE.exists():
+                  save_config(DEFAULT_CONFIG)
+                  return json.loads(json.dumps(DEFAULT_CONFIG))
+
+              try:
+                  with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                      data = json.load(f)
+              except (json.JSONDecodeError, OSError):
+                  data = {}
+
+              merged = _deep_merge_defaults(DEFAULT_CONFIG, data)
+              return merged
+
+
+          def _deep_merge_defaults(defaults: dict, data: dict) -> dict:
+              result = dict(defaults)
+              for key, value in data.items():
+                  if key in defaults and isinstance(defaults[key], dict) and isinstance(value, dict):
+                      result[key] = _deep_merge_defaults(defaults[key], value)
+                  else:
+                      result[key] = value
+              return result
+
+
+          def save_config(config: dict):
+              _ensure_dirs()
+              with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                  json.dump(config, f, indent=2)
+
+
+          def add_sound_to_library(config: dict, source_path: str, display_name: str) -> dict:
+              _ensure_dirs()
+              source_path = Path(source_path)
+              ext = source_path.suffix or ".mp3"
+              file_id = str(uuid.uuid4())
+              stored_filename = f"{file_id}{ext}"
+              dest_path = SOUNDS_DIR / stored_filename
+
+              shutil.copy2(source_path, dest_path)
+
+              entry = {
+                  "id": file_id,
+                  "name": display_name.strip() or source_path.stem,
+                  "filename": stored_filename,
+                  "volume": 1.0
+              }
+              config["soundboard"].append(entry)
+              save_config(config)
+              return entry
+
+
+          def rename_sound(config: dict, sound_id: str, new_name: str):
+              for entry in config["soundboard"]:
+                  if entry["id"] == sound_id:
+                      entry["name"] = new_name.strip() or entry["name"]
+                      break
+              save_config(config)
+
+
+          def remove_sound(config: dict, sound_id: str):
+              entry = next((e for e in config["soundboard"] if e["id"] == sound_id), None)
+              if entry:
+                  file_path = SOUNDS_DIR / entry["filename"]
+                  if file_path.exists():
+                      try:
+                          file_path.unlink()
+                      except OSError:
+                          pass
+                  config["soundboard"] = [e for e in config["soundboard"] if e["id"] != sound_id]
+                  save_config(config)
+
+
+          def get_sound_path(entry: dict) -> Path:
+              return SOUNDS_DIR / entry["filename"]
+          PYEOF
+          fi
+
+          if [ ! -f app/soundboard.py ]; then
+          cat > app/soundboard.py << 'PYEOF'
+          """
+          soundboard.py
+          Manages loading mp3s into numpy arrays and playing them mixed into the
+          outgoing audio stream. Uses pydub to decode mp3 -> PCM.
+          """
+
+          import numpy as np
+          from pydub import AudioSegment
+          from pathlib import Path
+          import threading
+
+
+          class SoundboardPlayer:
+              def __init__(self, samplerate: int = 48000, channels: int = 2):
+                  self.samplerate = samplerate
+                  self.channels = channels
+                  self._lock = threading.Lock()
+                  self._active_clips = []
+                  self._cache = {}
+
+              def _decode(self, filepath: Path) -> np.ndarray:
+                  key = str(filepath)
+                  if key in self._cache:
+                      return self._cache[key]
+
+                  seg = AudioSegment.from_file(filepath)
+                  seg = seg.set_frame_rate(self.samplerate).set_channels(self.channels)
+                  samples = np.array(seg.get_array_of_samples()).astype(np.float32)
+                  samples /= (2 ** (8 * seg.sample_width - 1))
+
+                  if self.channels > 1:
+                      samples = samples.reshape((-1, self.channels))
+                  else:
+                      samples = samples.reshape((-1, 1))
+
+                  self._cache[key] = samples
+                  return samples
+
+              def play(self, filepath: Path, volume: float = 1.0):
+                  audio = self._decode(filepath)
+                  with self._lock:
+                      self._active_clips.append({"audio": audio, "pos": 0, "volume": volume})
+
+              def stop_all(self):
+                  with self._lock:
+                      self._active_clips.clear()
+
+              def is_playing(self) -> bool:
+                  with self._lock:
+                      return len(self._active_clips) > 0
+
+              def read_block(self, num_frames: int) -> np.ndarray:
+                  out = np.zeros((num_frames, self.channels), dtype=np.float32)
+                  with self._lock:
+                      still_active = []
+                      for clip in self._active_clips:
+                          audio = clip["audio"]
+                          pos = clip["pos"]
+                          remaining = len(audio) - pos
+                          take = min(num_frames, remaining)
+                          if take > 0:
+                              out[:take] += audio[pos:pos + take] * clip["volume"]
+                              clip["pos"] += take
+                          if clip["pos"] < len(audio):
+                              still_active.append(clip)
+                      self._active_clips = still_active
+
+                  np.clip(out, -1.0, 1.0, out=out)
+                  return out
+          PYEOF
+          fi
+
+          if [ ! -f app/effects.py ]; then
+          cat > app/effects.py << 'PYEOF'
+          """
+          effects.py
+          Extensible audio effects chain.
+          """
+
+          import numpy as np
+
+
+          class Effect:
+              name = "base"
+
+              def __init__(self, enabled=False, params=None):
+                  self.enabled = enabled
+                  self.params = params or {}
+
+              def process(self, signal: np.ndarray, samplerate: int) -> np.ndarray:
+                  raise NotImplementedError
+
+              def to_dict(self):
+                  return {"enabled": self.enabled, "params": self.params}
+
+              def load_dict(self, data: dict):
+                  self.enabled = data.get("enabled", self.enabled)
+                  self.params.update(data.get("params", {}))
+
+
+          class DeepFryEffect(Effect):
+              name = "deep_fry"
+
+              def __init__(self, enabled=False, drive=8.0, bitcrush_depth=6, eq_boost_db=10.0):
+                  super().__init__(enabled, {
+                      "drive": drive,
+                      "bitcrush_depth": bitcrush_depth,
+                      "eq_boost_db": eq_boost_db,
+                  })
+
+              def process(self, signal: np.ndarray, samplerate: int) -> np.ndarray:
+                  drive = float(self.params.get("drive", 8.0))
+                  bit_depth = int(self.params.get("bitcrush_depth", 6))
+                  eq_boost_db = float(self.params.get("eq_boost_db", 10.0))
+
+                  x = signal.copy()
+                  x = np.tanh(x * drive)
+                  x = self._mid_boost(x, samplerate, eq_boost_db)
+
+                  levels = 2 ** max(2, bit_depth)
+                  x = np.round(x * levels) / levels
+
+                  x = np.clip(x * 1.5, -1.0, 1.0)
+                  return x
+
+              @staticmethod
+              def _mid_boost(x: np.ndarray, samplerate: int, boost_db: float) -> np.ndarray:
+                  if boost_db == 0:
+                      return x
+
+                  freq = 2000.0
+                  Q = 1.2
+                  A = 10 ** (boost_db / 40.0)
+                  w0 = 2 * np.pi * freq / samplerate
+                  alpha = np.sin(w0) / (2 * Q)
+                  cos_w0 = np.cos(w0)
+
+                  b0 = 1 + alpha * A
+                  b1 = -2 * cos_w0
+                  b2 = 1 - alpha * A
+                  a0 = 1 + alpha / A
+                  a1 = -2 * cos_w0
+                  a2 = 1 - alpha / A
+
+                  b = np.array([b0, b1, b2]) / a0
+                  a = np.array([1.0, a1 / a0, a2 / a0])
+
+                  from scipy.signal import lfilter
+                  if x.ndim == 1:
+                      return lfilter(b, a, x).astype(np.float32)
+                  else:
+                      out = np.zeros_like(x)
+                      for ch in range(x.shape[1]):
+                          out[:, ch] = lfilter(b, a, x[:, ch])
+                      return out.astype(np.float32)
+
+
+          class GainEffect(Effect):
+              name = "gain"
+
+              def __init__(self, enabled=True, gain_db=0.0):
+                  super().__init__(enabled, {"gain_db": gain_db})
+
+              def process(self, signal: np.ndarray, samplerate: int) -> np.ndarray:
+                  gain_db = float(self.params.get("gain_db", 0.0))
+                  factor = 10 ** (gain_db / 20.0)
+                  return np.clip(signal * factor, -1.0, 1.0)
+
+
+          class EffectChain:
+              def __init__(self):
+                  self.gain = GainEffect(enabled=True, gain_db=0.0)
+                  self.deep_fry = DeepFryEffect(enabled=False)
+                  self.effects = [self.deep_fry]
+
+              def register(self, effect: Effect):
+                  self.effects.append(effect)
+
+              def process(self, signal: np.ndarray, samplerate: int) -> np.ndarray:
+                  out = self.gain.process(signal, samplerate)
+                  for fx in self.effects:
+                      if fx.enabled:
+                          out = fx.process(out, samplerate)
+                  return out
+
+              def set_deep_fry_enabled(self, enabled: bool):
+                  self.deep_fry.enabled = enabled
+
+              def set_mic_gain_db(self, gain_db: float):
+                  self.gain.params["gain_db"] = gain_db
+
+              def to_config_dict(self) -> dict:
+                  return {
+                      "mic_gain_db": self.gain.params.get("gain_db", 0.0),
+                      "effects": {
+                          "deep_fry": self.deep_fry.to_dict()
+                      }
+                  }
+
+              def load_config_dict(self, config: dict):
+                  self.gain.params["gain_db"] = config.get("mic_gain_db", 0.0)
+                  fx_cfg = config.get("effects", {}).get("deep_fry", {})
+                  self.deep_fry.load_dict(fx_cfg)
+          PYEOF
+          fi
+
+          if [ ! -f app/audio_engine.py ]; then
+          cat > app/audio_engine.py << 'PYEOF'
+          """
+          audio_engine.py
+          Real-time audio engine: captures your real mic, runs it through the
+          EffectChain, mixes in any playing soundboard clips, and streams the result
+          out to the virtual cable device.
+          """
+
+          import sounddevice as sd
+          import numpy as np
+          import threading
+
+          from effects import EffectChain
+          from soundboard import SoundboardPlayer
+
+          SAMPLE_RATE = 48000
+          BLOCK_SIZE = 1024
+          CHANNELS = 2
+
+
+          class AudioEngine:
+              def __init__(self, mic_device=None, output_device=None, monitor_device=None):
+                  self.mic_device = mic_device
+                  self.output_device = output_device
+                  self.monitor_device = monitor_device
+                  self.monitor_enabled = False
+
+                  self.chain = EffectChain()
+                  self.soundboard = SoundboardPlayer(samplerate=SAMPLE_RATE, channels=CHANNELS)
+
+                  self._stream = None
+                  self._lock = threading.Lock()
+                  self._running = False
+
+              @staticmethod
+              def list_input_devices():
+                  devices = sd.query_devices()
+                  return [
+                      {"index": i, "name": d["name"]}
+                      for i, d in enumerate(devices)
+                      if d["max_input_channels"] > 0
+                  ]
+
+              @staticmethod
+              def list_output_devices():
+                  devices = sd.query_devices()
+                  return [
+                      {"index": i, "name": d["name"]}
+                      for i, d in enumerate(devices)
+                      if d["max_output_channels"] > 0
+                  ]
+
+              @staticmethod
+              def find_vb_cable_output_index():
+                  for d in AudioEngine.list_output_devices():
+                      if "CABLE Input" in d["name"]:
+                          return d["index"]
+                  return None
+
+              def start(self):
+                  if self._running:
+                      return
+
+                  def callback(indata, outdata, frames, time_info, status):
+                      if status:
+                          pass
+
+                      with self._lock:
+                          mic_signal = indata.copy()
+                          if mic_signal.shape[1] == 1 and CHANNELS == 2:
+                              mic_signal = np.repeat(mic_signal, 2, axis=1)
+
+                          processed = self.chain.process(mic_signal, SAMPLE_RATE)
+
+                          sb_block = self.soundboard.read_block(frames)
+                          mixed = np.clip(processed + sb_block, -1.0, 1.0)
+
+                          outdata[:] = mixed
+
+                  self._stream = sd.Stream(
+                      samplerate=SAMPLE_RATE,
+                      blocksize=BLOCK_SIZE,
+                      dtype="float32",
+                      channels=CHANNELS,
+                      device=(self.mic_device, self.output_device),
+                      callback=callback,
+                  )
+                  self._stream.start()
+                  self._running = True
+
+              def stop(self):
+                  if self._stream is not None:
+                      self._stream.stop()
+                      self._stream.close()
+                      self._stream = None
+                  self._running = False
+
+              def is_running(self):
+                  return self._running
+
+              def set_mic_gain_db(self, gain_db: float):
+                  with self._lock:
+                      self.chain.set_mic_gain_db(gain_db)
+
+              def set_deep_fry_enabled(self, enabled: bool):
+                  with self._lock:
+                      self.chain.set_deep_fry_enabled(enabled)
+
+              def update_deep_fry_params(self, **kwargs):
+                  with self._lock:
+                      self.chain.deep_fry.params.update(kwargs)
+
+              def play_sound(self, filepath, volume=1.0):
+                  self.soundboard.play(filepath, volume)
+
+              def stop_all_sounds(self):
+                  self.soundboard.stop_all()
+          PYEOF
+          fi
+
+          if [ ! -f app/gui/__init__.py ]; then
+          cat > app/gui/__init__.py << 'PYEOF'
+          """GUI package for CrownDrip Audio Modder."""
+          PYEOF
+          fi
+
+          if [ ! -f app/gui/widgets.py ]; then
+          cat > app/gui/widgets.py << 'PYEOF'
+          """
+          gui/widgets.py
+          Custom-styled widgets for the gold & black theme.
+          """
+
+          from PySide6.QtCore import Qt, QSize, QPropertyAnimation, QEasingCurve, Property, Signal
+          from PySide6.QtGui import QPainter, QColor
+          from PySide6.QtWidgets import QWidget
+
+
+          class ToggleSwitch(QWidget):
+              toggled = Signal(bool)
+
+              def __init__(self, parent=None, checked=False):
+                  super().__init__(parent)
+                  self._checked = checked
+                  self._circle_pos = 22.0 if checked else 3.0
+                  self.setFixedSize(46, 24)
+                  self.setCursor(Qt.PointingHandCursor)
+
+                  self._anim = QPropertyAnimation(self, b"circle_pos", self)
+                  self._anim.setDuration(160)
+                  self._anim.setEasingCurve(QEasingCurve.OutCubic)
+
+              def get_circle_pos(self):
+                  return self._circle_pos
+
+              def set_circle_pos(self, pos):
+                  self._circle_pos = pos
+                  self.update()
+
+              circle_pos = Property(float, get_circle_pos, set_circle_pos)
+
+              def is_checked(self):
+                  return self._checked
+
+              def set_checked(self, checked: bool, emit=True):
+                  if self._checked == checked:
+                      return
+                  self._checked = checked
+                  self._anim.stop()
+                  self._anim.setStartValue(self._circle_pos)
+                  self._anim.setEndValue(22.0 if checked else 3.0)
+                  self._anim.start()
+                  if emit:
+                      self.toggled.emit(checked)
+
+              def mousePressEvent(self, event):
+                  if event.button() == Qt.LeftButton:
+                      self.set_checked(not self._checked)
+
+              def sizeHint(self):
+                  return QSize(46, 24)
+
+              def paintEvent(self, event):
+                  painter = QPainter(self)
+                  painter.setRenderHint(QPainter.Antialiasing)
+
+                  track_color = QColor("#ffd166") if self._checked else QColor("#2a2a2a")
+                  border_color = QColor("#ffd166") if self._checked else QColor("#5a4a1a")
+
+                  painter.setPen(border_color)
+                  painter.setBrush(track_color)
+                  painter.drawRoundedRect(0, 0, self.width(), self.height(), 12, 12)
+
+                  circle_color = QColor("#0d0d0d") if self._checked else QColor("#8a7a4a")
+                  painter.setPen(Qt.NoPen)
+                  painter.setBrush(circle_color)
+                  painter.drawEllipse(int(self._circle_pos), 3, 18, 18)
+          PYEOF
+          fi
+
+          if [ ! -f app/gui/theme.qss ]; then
+          cat > app/gui/theme.qss << 'PYEOF'
+          QWidget {
+              background-color: #0d0d0d;
+              color: #f2d98a;
+              font-family: "Segoe UI", "Trebuchet MS", sans-serif;
+              font-size: 13px;
+          }
+
+          QMainWindow {
+              background-color: #0a0a0a;
+          }
+
+          QLabel#AppTitle {
+              color: #ffd166;
+              font-size: 22px;
+              font-weight: bold;
+              letter-spacing: 1px;
+              padding: 6px 0px;
+          }
+
+          QLabel#SectionTitle {
+              color: #ffd166;
+              font-size: 14px;
+              font-weight: 600;
+              padding-top: 10px;
+              border-bottom: 1px solid #3a2f10;
+              padding-bottom: 4px;
+          }
+
+          QLabel {
+              color: #e8d9a8;
+          }
+
+          QFrame#Panel {
+              background-color: #141414;
+              border: 1px solid #3a2f10;
+              border-radius: 10px;
+          }
+
+          QPushButton {
+              background-color: #1a1a1a;
+              color: #ffd166;
+              border: 1px solid #7a5c12;
+              border-radius: 8px;
+              padding: 8px 14px;
+              font-weight: 600;
+          }
+
+          QPushButton:hover {
+              background-color: #241c08;
+              border: 1px solid #ffd166;
+          }
+
+          QPushButton:pressed {
+              background-color: #332608;
+          }
+
+          QPushButton#PrimaryButton {
+              background-color: #ffd166;
+              color: #0d0d0d;
+              border: 1px solid #ffd166;
+          }
+
+          QPushButton#PrimaryButton:hover {
+              background-color: #ffdd8f;
+          }
+
+          QPushButton#DangerButton {
+              background-color: #1a1a1a;
+              color: #ff6b6b;
+              border: 1px solid #7a2020;
+          }
+
+          QPushButton#DangerButton:hover {
+              background-color: #2a1010;
+              border: 1px solid #ff6b6b;
+          }
+
+          QPushButton#DeepFryButtonOn {
+              background-color: #ff8c00;
+              color: #0d0d0d;
+              border: 1px solid #ffd166;
+          }
+
+          QListWidget {
+              background-color: #141414;
+              border: 1px solid #3a2f10;
+              border-radius: 8px;
+              padding: 4px;
+              outline: none;
+          }
+
+          QListWidget::item {
+              padding: 8px;
+              border-radius: 6px;
+              margin: 2px;
+          }
+
+          QListWidget::item:selected {
+              background-color: #332608;
+              color: #ffd166;
+          }
+
+          QListWidget::item:hover {
+              background-color: #1f1a0a;
+          }
+
+          QSlider::groove:horizontal {
+              height: 6px;
+              background: #2a2a2a;
+              border-radius: 3px;
+          }
+
+          QSlider::sub-page:horizontal {
+              background: #ffd166;
+              border-radius: 3px;
+          }
+
+          QSlider::handle:horizontal {
+              background: #ffd166;
+              border: 2px solid #0d0d0d;
+              width: 16px;
+              height: 16px;
+              margin: -6px 0;
+              border-radius: 8px;
+          }
+
+          QComboBox {
+              background-color: #1a1a1a;
+              border: 1px solid #7a5c12;
+              border-radius: 6px;
+              padding: 6px;
+              color: #f2d98a;
+          }
+
+          QComboBox::drop-down {
+              border: none;
+          }
+
+          QComboBox QAbstractItemView {
+              background-color: #1a1a1a;
+              color: #f2d98a;
+              selection-background-color: #332608;
+          }
+
+          QLineEdit {
+              background-color: #1a1a1a;
+              border: 1px solid #7a5c12;
+              border-radius: 6px;
+              padding: 6px;
+              color: #f2d98a;
+          }
+
+          QLineEdit:focus {
+              border: 1px solid #ffd166;
+          }
+
+          QScrollBar:vertical {
+              background: #141414;
+              width: 10px;
+          }
+
+          QScrollBar::handle:vertical {
+              background: #7a5c12;
+              border-radius: 5px;
+          }
+
+          QScrollBar::handle:vertical:hover {
+              background: #ffd166;
+          }
+
+          QStatusBar {
+              background-color: #0a0a0a;
+              color: #b89b52;
+              border-top: 1px solid #3a2f10;
+          }
+          PYEOF
+          fi
+
+          if [ ! -f app/gui/main_window.py ]; then
+          cat > app/gui/main_window.py << 'PYEOF'
+          """
+          gui/main_window.py
+          Main application window: gold & black themed control panel for the mic
+          routing engine + soundboard.
+          """
+
+          import sys
+          from pathlib import Path
+
+          from PySide6.QtCore import Qt
+          from PySide6.QtWidgets import (
+              QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+              QLabel, QPushButton, QSlider, QComboBox, QListWidget, QListWidgetItem,
+              QFrame, QFileDialog, QInputDialog, QMessageBox, QLineEdit, QStatusBar
+          )
+
+          sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+          import config as cfg
+          from audio_engine import AudioEngine
+          from gui.widgets import ToggleSwitch
+
+
+          class MainWindow(QMainWindow):
+              def __init__(self):
+                  super().__init__()
+                  self.setWindowTitle("CrownDrip Audio Modder")
+                  self.resize(760, 640)
+
+                  self.config = cfg.load_config()
+                  self.engine = AudioEngine()
+
+                  self._load_theme()
+                  self._build_ui()
+                  self._apply_loaded_config()
+                  self._populate_devices()
+
+                  self.status = QStatusBar()
+                  self.setStatusBar(self.status)
+                  self.status.showMessage("Ready. Select your mic + CABLE Input, then hit Start.")
+
+              def _load_theme(self):
+                  if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+                      base_path = Path(sys._MEIPASS) / "gui"
+                  else:
+                      base_path = Path(__file__).resolve().parent
+                  qss_path = base_path / "theme.qss"
+                  if qss_path.exists():
+                      self.setStyleSheet(qss_path.read_text(encoding="utf-8"))
+
+              def _build_ui(self):
+                  central = QWidget()
+                  self.setCentralWidget(central)
+                  root_layout = QVBoxLayout(central)
+                  root_layout.setContentsMargins(18, 14, 18, 14)
+                  root_layout.setSpacing(10)
+
+                  title = QLabel("\u2654 CROWNDRIP AUDIO MODDER")
+                  title.setObjectName("AppTitle")
+                  title.setAlignment(Qt.AlignCenter)
+                  root_layout.addWidget(title)
+
+                  device_panel = self._make_panel()
+                  dp_layout = QVBoxLayout(device_panel)
+                  dp_layout.addWidget(self._section_label("Devices"))
+
+                  mic_row = QHBoxLayout()
+                  mic_row.addWidget(QLabel("Mic Input:"))
+                  self.mic_combo = QComboBox()
+                  mic_row.addWidget(self.mic_combo, 1)
+                  dp_layout.addLayout(mic_row)
+
+                  out_row = QHBoxLayout()
+                  out_row.addWidget(QLabel("Output (Virtual Cable):"))
+                  self.output_combo = QComboBox()
+                  out_row.addWidget(self.output_combo, 1)
+                  dp_layout.addLayout(out_row)
+
+                  btn_row = QHBoxLayout()
+                  self.start_btn = QPushButton("\u25B6  Start Routing")
+                  self.start_btn.setObjectName("PrimaryButton")
+                  self.start_btn.clicked.connect(self.toggle_engine)
+                  btn_row.addWidget(self.start_btn)
+                  dp_layout.addLayout(btn_row)
+
+                  root_layout.addWidget(device_panel)
+
+                  mic_panel = self._make_panel()
+                  mp_layout = QVBoxLayout(mic_panel)
+                  mp_layout.addWidget(self._section_label("Mic Controls"))
+
+                  gain_row = QHBoxLayout()
+                  gain_row.addWidget(QLabel("Mic Gain (dB):"))
+                  self.gain_slider = QSlider(Qt.Horizontal)
+                  self.gain_slider.setMinimum(-20)
+                  self.gain_slider.setMaximum(20)
+                  self.gain_slider.setValue(0)
+                  self.gain_slider.valueChanged.connect(self.on_gain_changed)
+                  gain_row.addWidget(self.gain_slider, 1)
+                  self.gain_value_label = QLabel("0 dB")
+                  self.gain_value_label.setFixedWidth(50)
+                  gain_row.addWidget(self.gain_value_label)
+                  mp_layout.addLayout(gain_row)
+
+                  fry_row = QHBoxLayout()
+                  fry_label = QLabel("\U0001F35F Deep Fried Mode:")
+                  fry_row.addWidget(fry_label)
+                  fry_row.addStretch()
+                  self.deep_fry_toggle = ToggleSwitch()
+                  self.deep_fry_toggle.toggled.connect(self.on_deep_fry_toggled)
+                  fry_row.addWidget(self.deep_fry_toggle)
+                  mp_layout.addLayout(fry_row)
+
+                  root_layout.addWidget(mic_panel)
+
+                  sb_panel = self._make_panel()
+                  sb_layout = QVBoxLayout(sb_panel)
+                  sb_layout.addWidget(self._section_label("Soundboard"))
+
+                  self.sound_list = QListWidget()
+                  self.sound_list.itemDoubleClicked.connect(self.on_play_selected)
+                  sb_layout.addWidget(self.sound_list, 1)
+
+                  sb_btn_row = QHBoxLayout()
+                  add_btn = QPushButton("+ Add MP3")
+                  add_btn.clicked.connect(self.on_add_mp3)
+                  play_btn = QPushButton("\u25B6 Play")
+                  play_btn.clicked.connect(self.on_play_selected)
+                  rename_btn = QPushButton("Rename")
+                  rename_btn.clicked.connect(self.on_rename_selected)
+                  remove_btn = QPushButton("Remove")
+                  remove_btn.setObjectName("DangerButton")
+                  remove_btn.clicked.connect(self.on_remove_selected)
+                  stop_btn = QPushButton("\u25A0 Stop All")
+                  stop_btn.clicked.connect(self.on_stop_all)
+
+                  for b in (add_btn, play_btn, rename_btn, remove_btn, stop_btn):
+                      sb_btn_row.addWidget(b)
+                  sb_layout.addLayout(sb_btn_row)
+
+                  root_layout.addWidget(sb_panel, 1)
+
+              def _make_panel(self):
+                  panel = QFrame()
+                  panel.setObjectName("Panel")
+                  return panel
+
+              def _section_label(self, text):
+                  lbl = QLabel(text)
+                  lbl.setObjectName("SectionTitle")
+                  return lbl
+
+              def _apply_loaded_config(self):
+                  self.gain_slider.setValue(int(self.config.get("mic_gain_db", 0.0)))
+                  self.gain_value_label.setText(f"{int(self.config.get('mic_gain_db', 0.0))} dB")
+
+                  deep_fry_cfg = self.config.get("effects", {}).get("deep_fry", {})
+                  is_on = deep_fry_cfg.get("enabled", False)
+                  self.deep_fry_toggle.set_checked(is_on, emit=False)
+
+                  self.engine.chain.load_config_dict(self.config)
+
+                  self._refresh_sound_list()
+
+              def _populate_devices(self):
+                  mics = AudioEngine.list_input_devices()
+                  outputs = AudioEngine.list_output_devices()
+
+                  self.mic_combo.clear()
+                  for d in mics:
+                      self.mic_combo.addItem(d["name"], d["index"])
+
+                  self.output_combo.clear()
+                  cable_index = None
+                  for d in outputs:
+                      self.output_combo.addItem(d["name"], d["index"])
+                      if "CABLE Input" in d["name"]:
+                          cable_index = self.output_combo.count() - 1
+
+                  saved_mic = self.config.get("mic_device")
+                  if saved_mic:
+                      idx = self.mic_combo.findText(saved_mic)
+                      if idx >= 0:
+                          self.mic_combo.setCurrentIndex(idx)
+
+                  saved_out = self.config.get("output_device")
+                  if saved_out:
+                      idx = self.output_combo.findText(saved_out)
+                      if idx >= 0:
+                          self.output_combo.setCurrentIndex(idx)
+                  elif cable_index is not None:
+                      self.output_combo.setCurrentIndex(cable_index)
+
+              def _refresh_sound_list(self):
+                  self.sound_list.clear()
+                  for entry in self.config.get("soundboard", []):
+                      item = QListWidgetItem(entry["name"])
+                      item.setData(Qt.UserRole, entry["id"])
+                      self.sound_list.addItem(item)
+
+              def _save(self):
+                  self.config["mic_device"] = self.mic_combo.currentText()
+                  self.config["output_device"] = self.output_combo.currentText()
+                  self.config.update(self.engine.chain.to_config_dict())
+                  cfg.save_config(self.config)
+
+              def toggle_engine(self):
+                  if self.engine.is_running():
+                      self.engine.stop()
+                      self.start_btn.setText("\u25B6  Start Routing")
+                      self.status.showMessage("Stopped.")
+                  else:
+                      mic_idx = self.mic_combo.currentData()
+                      out_idx = self.output_combo.currentData()
+                      if mic_idx is None or out_idx is None:
+                          QMessageBox.warning(self, "Missing device", "Please select a mic and output device.")
+                          return
+                      self.engine.mic_device = mic_idx
+                      self.engine.output_device = out_idx
+                      try:
+                          self.engine.start()
+                          self.start_btn.setText("\u25A0  Stop Routing")
+                          self.status.showMessage(f"Routing live: mic -> {self.output_combo.currentText()}")
+                      except Exception as e:
+                          QMessageBox.critical(self, "Failed to start", str(e))
+                      self._save()
+
+              def on_gain_changed(self, value):
+                  self.gain_value_label.setText(f"{value} dB")
+                  self.engine.set_mic_gain_db(float(value))
+                  self._save()
+
+              def on_deep_fry_toggled(self, checked):
+                  self.engine.set_deep_fry_enabled(checked)
+                  self.status.showMessage("Deep Fried Mode: ON" if checked else "Deep Fried Mode: OFF")
+                  self._save()
+
+              def on_add_mp3(self):
+                  filepath, _ = QFileDialog.getOpenFileName(self, "Select MP3", "", "Audio Files (*.mp3 *.wav *.ogg)")
+                  if not filepath:
+                      return
+                  default_name = Path(filepath).stem
+                  name, ok = QInputDialog.getText(self, "Name this sound", "Display name:", QLineEdit.Normal, default_name)
+                  if not ok:
+                      return
+                  cfg.add_sound_to_library(self.config, filepath, name)
+                  self._refresh_sound_list()
+                  self.status.showMessage(f"Added '{name}' to soundboard.")
+
+              def _selected_entry(self):
+                  item = self.sound_list.currentItem()
+                  if not item:
+                      return None
+                  sound_id = item.data(Qt.UserRole)
+                  return next((e for e in self.config["soundboard"] if e["id"] == sound_id), None)
+
+              def on_play_selected(self):
+                  entry = self._selected_entry()
+                  if not entry:
+                      QMessageBox.information(self, "No sound selected", "Select a sound from the list first.")
+                      return
+                  filepath = cfg.get_sound_path(entry)
+                  try:
+                      self.engine.play_sound(filepath, entry.get("volume", 1.0))
+                      self.status.showMessage(f"Playing: {entry['name']}")
+                  except Exception as e:
+                      QMessageBox.critical(self, "Playback error", str(e))
+
+              def on_rename_selected(self):
+                  entry = self._selected_entry()
+                  if not entry:
+                      return
+                  name, ok = QInputDialog.getText(self, "Rename sound", "New name:", QLineEdit.Normal, entry["name"])
+                  if ok and name.strip():
+                      cfg.rename_sound(self.config, entry["id"], name)
+                      self._refresh_sound_list()
+
+              def on_remove_selected(self):
+                  entry = self._selected_entry()
+                  if not entry:
+                      return
+                  confirm = QMessageBox.question(self, "Remove sound", f"Remove '{entry['name']}' from soundboard?")
+                  if confirm == QMessageBox.Yes:
+                      cfg.remove_sound(self.config, entry["id"])
+                      self._refresh_sound_list()
+
+              def on_stop_all(self):
+                  self.engine.stop_all_sounds()
+                  self.status.showMessage("Stopped all soundboard playback.")
+
+              def closeEvent(self, event):
+                  self._save()
+                  self.engine.stop()
+                  event.accept()
+
+
+          def run():
+              app = QApplication(sys.argv)
+              window = MainWindow()
+              window.show()
+              sys.exit(app.exec())
+
+
+          if __name__ == "__main__":
+              run()
+          PYEOF
+          fi
+
+      - name: Commit scaffolded files back to repo
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "Auto-scaffold CrownDrip Audio Modder source files"
+          git push
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ffmpeg
+        run: choco install ffmpeg -y
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build EXE with PyInstaller
+        shell: bash
+        run: |
+          cd app
+          pyinstaller --noconfirm --onefile --windowed --name CrownDripAudioModder --add-data "gui/theme.qss;gui" main.py
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CrownDripAudioModder-windows
+          path: app/dist/CrownDripAudioModder.exe
