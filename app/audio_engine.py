@@ -1,14 +1,13 @@
 """
 audio_engine.py
 Real-time audio engine: captures your real mic, runs it through the
-EffectChain, mixes in any playing soundboard clips, and streams the result
-out to the virtual cable device.
+EffectChain, mixes in any playing soundboard clips (with their own
+volume/deep fry controls), and streams the result out to the virtual
+cable device.
 
-NOTE: Windows will not allow opening one single duplex sd.Stream() that
-combines two different devices/host APIs (real mic + VB-Cable). Doing so
-throws PaErrorCode -9993 "Illegal combination of I/O devices". The fix is
-to run two independent streams (InputStream + OutputStream) linked by a
-small thread-safe queue.
+Uses two independent streams (InputStream + OutputStream) linked by a
+thread-safe queue, since Windows won't allow one combined duplex stream
+across two different devices/host APIs (real mic + VB-Cable).
 """
 
 import sounddevice as sd
@@ -16,7 +15,7 @@ import numpy as np
 import threading
 import queue
 
-from effects import EffectChain
+from effects import EffectChain, GainEffect, DeepFryEffect
 from soundboard import SoundboardPlayer
 
 SAMPLE_RATE = 48000
@@ -31,7 +30,13 @@ class AudioEngine:
         self.monitor_device = monitor_device
         self.monitor_enabled = False
 
+        # mic effect chain (gain + deep fry)
         self.chain = EffectChain()
+
+        # separate soundboard (mp3) effect chain: volume + its own deep fry toggle
+        self.soundboard_gain = GainEffect(enabled=True, gain_db=0.0)
+        self.soundboard_deep_fry = DeepFryEffect(enabled=False)
+
         self.soundboard = SoundboardPlayer(samplerate=SAMPLE_RATE, channels=CHANNELS)
 
         self._input_stream = None
@@ -76,7 +81,7 @@ class AudioEngine:
             self._buffer.put_nowait(processed)
         except queue.Full:
             try:
-                self._buffer.get_nowait()  # drop oldest to stay realtime
+                self._buffer.get_nowait()
                 self._buffer.put_nowait(processed)
             except queue.Empty:
                 pass
@@ -94,15 +99,18 @@ class AudioEngine:
             block = fixed
 
         sb_block = self.soundboard.read_block(frames)
+
+        with self._lock:
+            sb_block = self.soundboard_gain.process(sb_block, SAMPLE_RATE)
+            if self.soundboard_deep_fry.enabled:
+                sb_block = self.soundboard_deep_fry.process(sb_block, SAMPLE_RATE)
+
         mixed = np.clip(block + sb_block, -1.0, 1.0)
         outdata[:] = mixed
 
     def start(self):
         if self._running:
             return
-
-        with self._buffer.mutex if hasattr(self._buffer, "mutex") else threading.Lock():
-            pass  # no-op, queue.Queue has its own locking
 
         self._input_stream = sd.InputStream(
             device=self.mic_device,
@@ -139,6 +147,8 @@ class AudioEngine:
     def is_running(self):
         return self._running
 
+    # ---------- mic controls ----------
+
     def set_mic_gain_db(self, gain_db: float):
         with self._lock:
             self.chain.set_mic_gain_db(gain_db)
@@ -151,8 +161,36 @@ class AudioEngine:
         with self._lock:
             self.chain.deep_fry.params.update(kwargs)
 
+    # ---------- soundboard (mp3) controls ----------
+
+    def set_soundboard_gain_db(self, gain_db: float):
+        with self._lock:
+            self.soundboard_gain.params["gain_db"] = gain_db
+
+    def set_soundboard_deep_fry_enabled(self, enabled: bool):
+        with self._lock:
+            self.soundboard_deep_fry.enabled = enabled
+
+    def update_soundboard_deep_fry_params(self, **kwargs):
+        with self._lock:
+            self.soundboard_deep_fry.params.update(kwargs)
+
     def play_sound(self, filepath, volume=1.0):
         self.soundboard.play(filepath, volume)
 
     def stop_all_sounds(self):
         self.soundboard.stop_all()
+
+    # ---------- persistence ----------
+
+    def to_config_dict(self) -> dict:
+        d = self.chain.to_config_dict()
+        d["soundboard_volume_db"] = self.soundboard_gain.params.get("gain_db", 0.0)
+        d["effects"]["soundboard_deep_fry"] = self.soundboard_deep_fry.to_dict()
+        return d
+
+    def load_config_dict(self, config: dict):
+        self.chain.load_config_dict(config)
+        self.soundboard_gain.params["gain_db"] = config.get("soundboard_volume_db", 0.0)
+        sfx_cfg = config.get("effects", {}).get("soundboard_deep_fry", {})
+        self.soundboard_deep_fry.load_dict(sfx_cfg)
