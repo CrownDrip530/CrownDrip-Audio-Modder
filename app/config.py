@@ -1,12 +1,6 @@
 """
 config.py
-Handles all persistent memory for CrownDrip Audio Modder:
-- App settings (mic gain, deep fry on/off, selected devices, effect params)
-- Soundboard library (mp3 file references + custom names)
-
-Everything lives under %APPDATA%/CrownDripAudioModder/ so it survives
-closing the app, rebooting, or even deleting the original mp3 you uploaded
-(we copy it into our own storage folder).
+Handles all persistent memory for CrownDrip Audio Modder.
 """
 
 import json
@@ -25,9 +19,16 @@ DEFAULT_CONFIG = {
     "mic_device": None,
     "output_device": None,
     "mic_gain_db": 0.0,
+    "soundboard_volume_db": 0.0,
     "monitor_enabled": False,
     "effects": {
         "deep_fry": {
+            "enabled": False,
+            "drive": 8.0,
+            "bitcrush_depth": 6,
+            "eq_boost_db": 10.0
+        },
+        "soundboard_deep_fry": {
             "enabled": False,
             "drive": 8.0,
             "bitcrush_depth": 6,
