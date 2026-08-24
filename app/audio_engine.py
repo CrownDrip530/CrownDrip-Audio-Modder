@@ -2,22 +2,24 @@
 audio_engine.py
 Real-time audio engine.
 
-Two streams total, ever:
-  - one InputStream for the mic (captures + runs EffectChain)
-  - one OutputStream to the virtual cable (mixes mic passthrough + soundboard)
+Two streams total: one InputStream (mic) and one OutputStream (virtual
+cable), with the soundboard mixed directly into the output callback (no
+extra threads/streams -- see soundboard.py for why).
 
-The soundboard is NOT given its own separate stream/thread. Python's GIL
-means multiple independent real-time audio callback threads fight over the
-same lock roughly every ~20ms; giving every mp3 its own stream caused
-audible choppy dropout artifacts (mistaken for "wobble") from thread
-contention. Instead, SoundboardPlayer.read_block() is called directly
-inside the SAME output callback that handles mic passthrough -- it's just
-cheap numpy slicing/summation, no new threads involved.
-
-The mic input and cable output streams still run on independent hardware
-clocks that drift apart over time, which is bridged by ElasticBuffer
-(gentle speed up/down via linear interpolation, well under audible
-threshold) rather than abrupt block drop/repeat.
+IMPORTANT -- BUFFER UNDERRUNS ("sudden quiet / sounds like background"):
+Every audio callback must return within one block's time budget (with the
+previous 1024-sample block size, that's only ~21ms at 48kHz). If Python
+occasionally takes even slightly longer than that -- due to normal
+interpreter overhead, a garbage collection pause, or a brief CPU spike from
+something else running on the PC -- the driver conceals the missed
+deadline with silence or stale audio for an instant. That's heard as a
+sudden, brief volume dip / "distant" sounding artifact, distinct from the
+resampling/threading issues fixed earlier. This is a classic real-time
+audio underrun, and the standard fix is to give the callback a bigger time
+budget: a larger block size, and explicitly requesting "high latency" mode
+from WASAPI so Windows allocates bigger internal buffers. This trades a
+small amount of extra fixed delay (roughly +50-100ms) for much more
+headroom against these dropouts.
 """
 
 import sounddevice as sd
@@ -27,12 +29,13 @@ import threading
 from effects import EffectChain
 from soundboard import SoundboardPlayer
 
-BLOCK_SIZE = 1024
+BLOCK_SIZE = 2048          # larger block = more time budget per callback
+STREAM_LATENCY = "high"    # ask WASAPI for bigger internal buffers
 DEFAULT_SAMPLE_RATE = 48000
 DEFAULT_CHANNELS = 2
 
-TARGET_LATENCY_SEC = 0.12
-MAX_LATENCY_SEC = 0.6
+TARGET_LATENCY_SEC = 0.18
+MAX_LATENCY_SEC = 0.8
 
 
 def _get_wasapi_hostapi_index():
@@ -107,6 +110,7 @@ class AudioEngine:
         self._lock = threading.Lock()
         self._running = False
         self._elastic = None
+        self.xrun_count = 0
 
     @staticmethod
     def list_input_devices():
@@ -143,6 +147,9 @@ class AudioEngine:
             return {}
 
     def _input_callback(self, indata, frames, time_info, status):
+        if status:
+            self.xrun_count += 1
+
         with self._lock:
             mic_signal = indata.copy()
             processed = self.chain.process(mic_signal, self.input_rate)
@@ -162,6 +169,9 @@ class AudioEngine:
             self._elastic.write(processed)
 
     def _output_callback(self, outdata, frames, time_info, status):
+        if status:
+            self.xrun_count += 1
+
         if self._elastic is not None:
             block = self._elastic.read(frames)
         else:
@@ -188,6 +198,8 @@ class AudioEngine:
         if self._running:
             return
 
+        self.xrun_count = 0
+
         mic_info = self._get_device_info(self.mic_device)
         out_info = self._get_device_info(self.output_device)
 
@@ -203,6 +215,7 @@ class AudioEngine:
             samplerate=requested_input_rate,
             blocksize=BLOCK_SIZE,
             dtype="float32",
+            latency=STREAM_LATENCY,
             callback=self._input_callback,
         )
         self._output_stream = sd.OutputStream(
@@ -211,6 +224,7 @@ class AudioEngine:
             samplerate=requested_output_rate,
             blocksize=BLOCK_SIZE,
             dtype="float32",
+            latency=STREAM_LATENCY,
             callback=self._output_callback,
         )
 
