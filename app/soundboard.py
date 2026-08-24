@@ -2,11 +2,20 @@
 soundboard.py
 Manages loading mp3s into numpy arrays and playing them mixed into the
 outgoing audio stream. Uses pydub (ffmpeg) purely for DECODING, then does
-our own high-quality resampling with scipy instead of relying on pydub's
-built-in frame rate conversion (which uses Python's old `audioop` module --
-a crude linear-interpolation resampler that introduces audible wobble/
-warping artifacts, especially when the source rate doesn't cleanly divide
-into the target rate, e.g. 44100 -> 48000).
+our own high-quality resampling with scipy.signal.resample_poly instead of
+relying on pydub's built-in frame rate conversion (a crude linear
+interpolation resampler that causes audible wobble).
+
+NOTE: an earlier version of this file had a "safety cap" that fell back to
+a cheap interpolation resampler whenever the up/down conversion factors
+were "too large". Unfortunately the single most common real-world case --
+44100 Hz (typical mp3) -> 48000 Hz (typical virtual cable rate) -- reduces
+to up=160, down=147, which tripped that cap every time. That meant the
+high-quality resampler was silently never actually used, and the same
+wobble bug persisted. The cap has been removed: resample_poly is only run
+once per unique file (result is cached), so there's no real performance
+concern even with larger factors (a full 3-minute song resamples in well
+under half a second, one time only).
 
 Playback is tracked per sound_id so that pressing Play again on a sound
 that's already playing RESTARTS it instead of stacking a second overlapping
@@ -22,9 +31,10 @@ import threading
 
 def _high_quality_resample(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
     """Resample (frames, channels) float32 audio from src_rate to dst_rate
-    using a proper polyphase filter (scipy.signal.resample_poly), which is
-    far cleaner than simple linear interpolation and avoids the "wobbly"
-    artifacts that come from lower quality resamplers."""
+    using a proper polyphase filter (scipy.signal.resample_poly). Always
+    used regardless of the size of the up/down factors -- this only runs
+    once per unique file (cached afterward), so it's cheap enough even for
+    "unfriendly" rate ratios like 44100->48000 (up=160, down=147)."""
     if src_rate == dst_rate:
         return samples
 
@@ -34,17 +44,10 @@ def _high_quality_resample(samples: np.ndarray, src_rate: int, dst_rate: int) ->
     up = dst_rate // g
     down = src_rate // g
 
-    if up > 32 or down > 32:
-        out = np.empty((int(round(len(samples) * dst_rate / src_rate)), samples.shape[1]), dtype=np.float32)
-        x_old = np.linspace(0.0, 1.0, num=len(samples), endpoint=False)
-        x_new = np.linspace(0.0, 1.0, num=len(out), endpoint=False)
-        for ch in range(samples.shape[1]):
-            out[:, ch] = np.interp(x_new, x_old, samples[:, ch])
-        return out.astype(np.float32)
-
-    resampled_channels = []
-    for ch in range(samples.shape[1]):
-        resampled_channels.append(resample_poly(samples[:, ch], up, down))
+    resampled_channels = [
+        resample_poly(samples[:, ch], up, down)
+        for ch in range(samples.shape[1])
+    ]
     out = np.stack(resampled_channels, axis=1).astype(np.float32)
     return out
 
