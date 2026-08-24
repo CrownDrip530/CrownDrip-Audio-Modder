@@ -1,22 +1,26 @@
 """
 audio_engine.py
-Real-time audio engine: captures your real mic, runs it through the
-EffectChain, mixes in any playing soundboard clips, and streams the result
-out to the virtual cable device.
+Real-time audio engine.
 
-Uses an ElasticBuffer to bridge the mic input stream and the virtual cable
-output stream, since they run on independent hardware clocks that drift
-over time. The soundboard decodes/resamples MP3s using a proper high
-quality resampler (see soundboard.py) matched to the ACTUAL stream sample
-rate sounddevice reports after opening the stream (not just the device's
-reported "default" rate, which can occasionally differ slightly).
+Mic passthrough: captures your real mic, runs it through the EffectChain,
+and streams it out to the virtual cable device via an ElasticBuffer that
+bridges the two independently-clocked devices smoothly (no audible warble
+from clock drift).
+
+Soundboard (MP3) playback: handled entirely by soundboard.py, which opens
+its OWN short-lived stream(s) directly to the virtual cable device at each
+file's native rate. Windows' WASAPI shared-mode audio engine natively
+mixes multiple simultaneous streams to the same device, so this plays
+alongside mic passthrough correctly with zero custom resampling/mixing
+code on our end -- this is what actually fixed the "wobbly after a few
+seconds" mp3 bug for good, versus manually resampling/mixing it ourselves.
 """
 
 import sounddevice as sd
 import numpy as np
 import threading
 
-from effects import EffectChain, GainEffect, DeepFryEffect
+from effects import EffectChain
 from soundboard import SoundboardPlayer
 
 BLOCK_SIZE = 1024
@@ -35,11 +39,6 @@ def _get_wasapi_hostapi_index():
 
 
 class ElasticBuffer:
-    """Thread-safe adaptive buffer that bridges two independently-clocked
-    audio streams by gently speeding up/slowing down playback (a tiny,
-    inaudible ratio) via linear-interpolation resampling, instead of
-    abruptly dropping or repeating whole blocks."""
-
     def __init__(self, channels: int, samplerate: int):
         self.channels = channels
         self.samplerate = samplerate
@@ -91,15 +90,12 @@ class AudioEngine:
         self.monitor_enabled = False
 
         self.chain = EffectChain()
-        self.soundboard_gain = GainEffect(enabled=True, gain_db=0.0)
-        self.soundboard_deep_fry = DeepFryEffect(enabled=False)
+        self.soundboard = SoundboardPlayer()
 
         self.input_rate = DEFAULT_SAMPLE_RATE
         self.output_rate = DEFAULT_SAMPLE_RATE
         self.input_channels = DEFAULT_CHANNELS
         self.output_channels = DEFAULT_CHANNELS
-
-        self.soundboard = SoundboardPlayer(samplerate=DEFAULT_SAMPLE_RATE, channels=DEFAULT_CHANNELS)
 
         self._input_stream = None
         self._output_stream = None
@@ -165,28 +161,7 @@ class AudioEngine:
             block = self._elastic.read(frames)
         else:
             block = np.zeros((frames, self.output_channels), dtype=np.float32)
-
-        sb_block = self.soundboard.read_block(frames)
-
-        with self._lock:
-            sb_block = self.soundboard_gain.process(sb_block, self.output_rate)
-            if self.soundboard_deep_fry.enabled:
-                sb_block = self.soundboard_deep_fry.process(sb_block, self.output_rate)
-
-        mixed = block + sb_block
-        mixed = self._soft_limit(mixed)
-        outdata[:] = mixed
-
-    @staticmethod
-    def _soft_limit(x: np.ndarray, threshold: float = 0.8) -> np.ndarray:
-        out = np.copy(x)
-        over_mask = np.abs(x) > threshold
-        if np.any(over_mask):
-            sign = np.sign(x[over_mask])
-            excess = np.abs(x[over_mask]) - threshold
-            compressed = threshold + (1.0 - threshold) * np.tanh(excess / (1.0 - threshold))
-            out[over_mask] = sign * compressed
-        return np.clip(out, -1.0, 1.0)
+        outdata[:] = np.clip(block, -1.0, 1.0)
 
     def start(self):
         if self._running:
@@ -221,8 +196,9 @@ class AudioEngine:
         self.input_rate = int(round(self._input_stream.samplerate))
         self.output_rate = int(round(self._output_stream.samplerate))
 
-        self.soundboard = SoundboardPlayer(samplerate=self.output_rate, channels=self.output_channels)
         self._elastic = ElasticBuffer(channels=self.output_channels, samplerate=self.output_rate)
+
+        self.soundboard.output_device = self.output_device
 
         self._input_stream.start()
         self._output_stream.start()
@@ -239,6 +215,7 @@ class AudioEngine:
             self._output_stream = None
         self._elastic = None
         self._running = False
+        self.soundboard.stop_all()
 
     def is_running(self):
         return self._running
@@ -256,18 +233,17 @@ class AudioEngine:
             self.chain.deep_fry.params.update(kwargs)
 
     def set_soundboard_gain_db(self, gain_db: float):
-        with self._lock:
-            self.soundboard_gain.params["gain_db"] = gain_db
+        self.soundboard.set_gain_db(gain_db)
 
     def set_soundboard_deep_fry_enabled(self, enabled: bool):
-        with self._lock:
-            self.soundboard_deep_fry.enabled = enabled
+        self.soundboard.set_deep_fry_enabled(enabled)
 
     def update_soundboard_deep_fry_params(self, **kwargs):
-        with self._lock:
-            self.soundboard_deep_fry.params.update(kwargs)
+        self.soundboard.update_deep_fry_params(**kwargs)
 
     def play_sound(self, filepath, volume=1.0, sound_id=None):
+        if self.soundboard.output_device is None:
+            self.soundboard.output_device = self.output_device
         self.soundboard.play(filepath, volume, sound_id=sound_id)
 
     def stop_sound(self, sound_id):
@@ -278,12 +254,12 @@ class AudioEngine:
 
     def to_config_dict(self) -> dict:
         d = self.chain.to_config_dict()
-        d["soundboard_volume_db"] = self.soundboard_gain.params.get("gain_db", 0.0)
-        d["effects"]["soundboard_deep_fry"] = self.soundboard_deep_fry.to_dict()
+        d["soundboard_volume_db"] = self.soundboard.gain.params.get("gain_db", 0.0)
+        d["effects"]["soundboard_deep_fry"] = self.soundboard.deep_fry.to_dict()
         return d
 
     def load_config_dict(self, config: dict):
         self.chain.load_config_dict(config)
-        self.soundboard_gain.params["gain_db"] = config.get("soundboard_volume_db", 0.0)
+        self.soundboard.gain.params["gain_db"] = config.get("soundboard_volume_db", 0.0)
         sfx_cfg = config.get("effects", {}).get("soundboard_deep_fry", {})
-        self.soundboard_deep_fry.load_dict(sfx_cfg)
+        self.soundboard.deep_fry.load_dict(sfx_cfg)
