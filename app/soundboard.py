@@ -1,17 +1,21 @@
 """
 soundboard.py
 Plays MP3 soundboard clips by opening a dedicated sounddevice OutputStream
-DIRECTLY to the virtual cable device, at the file's own native sample rate
-and channel count. This lets Windows' own WASAPI shared-mode audio engine
-handle sample-rate conversion and mixing with the mic passthrough stream,
-instead of us doing our own resampling/mixing in Python.
+DIRECTLY to the virtual cable device. This lets Windows' own WASAPI
+shared-mode audio engine mix soundboard playback together with the mic
+passthrough stream at the OS level.
 
-This is what actually fixes the "wobbly after a few seconds" MP3 bug for
-good -- WASAPI shared mode natively supports multiple simultaneous streams
-to the same device (this is how e.g. Discord + a game + a Windows
-notification sound can all play through the same speaker at once), so mic
-passthrough and soundboard playback mix together correctly at the OS
-level with zero custom resampling code required.
+IMPORTANT: VB-Cable's WASAPI endpoint only accepts ONE specific sample
+rate (whatever Windows has it configured to -- almost always 48000Hz) and
+will immediately fail with PaErrorCode -9997 "Invalid sample rate" if you
+try to open a stream at a different rate (e.g. a typical mp3's native
+44100Hz). So we can't just open the stream at the file's native rate.
+
+Fix: query the output device's actual accepted default sample rate, and
+resample each mp3 to that rate ONCE at decode time (cached afterward)
+using a proper polyphase resampler (scipy.signal.resample_poly), then open
+the playback stream at that same device rate. This avoids both the
+"invalid sample rate" error AND the wobble caused by cheap resamplers.
 
 Each sound plays on a short-lived independent stream that closes itself
 automatically when the clip finishes. Pressing Play again on a sound
@@ -19,6 +23,7 @@ that's already playing restarts it (stops the old stream, starts a fresh
 one) instead of stacking an overlapping copy.
 """
 
+import math
 import threading
 import uuid
 import numpy as np
@@ -27,6 +32,27 @@ from pydub import AudioSegment
 from pathlib import Path
 
 from effects import GainEffect, DeepFryEffect
+
+
+def _high_quality_resample(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    """Resample (frames, channels) float32 audio from src_rate to dst_rate
+    using scipy's polyphase filter. Only runs once per unique (file, rate)
+    combination -- cached afterward -- so cost is negligible even for
+    unfriendly ratios like 44100->48000 (up=160, down=147)."""
+    if src_rate == dst_rate:
+        return samples
+
+    from scipy.signal import resample_poly
+
+    g = math.gcd(src_rate, dst_rate)
+    up = dst_rate // g
+    down = src_rate // g
+
+    resampled_channels = [
+        resample_poly(samples[:, ch], up, down)
+        for ch in range(samples.shape[1])
+    ]
+    return np.stack(resampled_channels, axis=1).astype(np.float32)
 
 
 class _ActiveClip:
@@ -47,10 +73,20 @@ class SoundboardPlayer:
         self.gain = GainEffect(enabled=True, gain_db=0.0)
         self.deep_fry = DeepFryEffect(enabled=False)
 
-    def _decode(self, filepath: Path):
-        key = str(filepath)
-        if key in self._cache:
-            return self._cache[key]
+    def _get_output_format(self):
+        try:
+            info = sd.query_devices(self.output_device)
+            rate = int(round(info.get("default_samplerate", 48000) or 48000))
+            max_out = int(info.get("max_output_channels", 2) or 2)
+            channels = 2 if max_out >= 2 else max(1, max_out)
+            return rate, channels
+        except Exception:
+            return 48000, 2
+
+    def _decode_and_prepare(self, filepath: Path, device_rate: int, device_channels: int) -> np.ndarray:
+        cache_key = (str(filepath), device_rate, device_channels)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
 
         seg = AudioSegment.from_file(filepath)
         native_rate = seg.frame_rate
@@ -64,45 +100,31 @@ class SoundboardPlayer:
         else:
             samples = samples.reshape((-1, 1))
 
-        samples = np.ascontiguousarray(samples)
-        self._cache[key] = (samples, native_rate, native_channels)
-        return self._cache[key]
+        if native_channels != device_channels:
+            if native_channels == 1 and device_channels == 2:
+                samples = np.repeat(samples, 2, axis=1)
+            elif native_channels == 2 and device_channels == 1:
+                samples = samples.mean(axis=1, keepdims=True)
+            else:
+                fixed = np.zeros((samples.shape[0], device_channels), dtype=np.float32)
+                n = min(samples.shape[1], device_channels)
+                fixed[:, :n] = samples[:, :n]
+                samples = fixed
 
-    def _resolve_playback_channels(self, native_channels: int) -> int:
-        try:
-            info = sd.query_devices(self.output_device)
-            max_out = int(info.get("max_output_channels", native_channels) or native_channels)
-        except Exception:
-            max_out = native_channels
+        if native_rate != device_rate:
+            samples = _high_quality_resample(samples, native_rate, device_rate)
 
-        if max_out <= 0:
-            return native_channels
-        if native_channels == 1 and max_out >= 2:
-            return 2
-        return min(native_channels, max_out)
-
-    @staticmethod
-    def _convert_channels(samples: np.ndarray, native_channels: int, target_channels: int) -> np.ndarray:
-        if native_channels == target_channels:
-            return samples
-        if native_channels == 1 and target_channels == 2:
-            return np.repeat(samples, 2, axis=1)
-        if native_channels == 2 and target_channels == 1:
-            return samples.mean(axis=1, keepdims=True)
-        fixed = np.zeros((samples.shape[0], target_channels), dtype=np.float32)
-        n = min(samples.shape[1], target_channels)
-        fixed[:, :n] = samples[:, :n]
-        return fixed
+        samples = np.ascontiguousarray(samples.astype(np.float32))
+        self._cache[cache_key] = samples
+        return samples
 
     def play(self, filepath: Path, volume: float = 1.0, sound_id: str = None):
-        samples, native_rate, native_channels = self._decode(filepath)
+        device_rate, device_channels = self._get_output_format()
+        data = self._decode_and_prepare(filepath, device_rate, device_channels)
 
         key = sound_id if sound_id is not None else str(uuid.uuid4())
         if sound_id is not None:
             self.stop_sound(sound_id)
-
-        playback_channels = self._resolve_playback_channels(native_channels)
-        data = self._convert_channels(samples, native_channels, playback_channels)
 
         pos = {"i": 0}
 
@@ -113,16 +135,16 @@ class SoundboardPlayer:
 
             finished = False
             if len(chunk) < frames:
-                fixed = np.zeros((frames, playback_channels), dtype=np.float32)
+                fixed = np.zeros((frames, device_channels), dtype=np.float32)
                 fixed[:len(chunk)] = chunk
                 chunk = fixed
                 finished = True
 
             processed = chunk * volume
             with self._lock:
-                processed = self.gain.process(processed, native_rate)
+                processed = self.gain.process(processed, device_rate)
                 if self.deep_fry.enabled:
-                    processed = self.deep_fry.process(processed, native_rate)
+                    processed = self.deep_fry.process(processed, device_rate)
 
             outdata[:] = np.clip(processed, -1.0, 1.0)
             pos["i"] = end
@@ -132,8 +154,8 @@ class SoundboardPlayer:
 
         stream = sd.OutputStream(
             device=self.output_device,
-            channels=playback_channels,
-            samplerate=native_rate,
+            channels=device_channels,
+            samplerate=device_rate,
             dtype="float32",
             callback=callback,
             finished_callback=lambda k=key: self._on_finished(k),
