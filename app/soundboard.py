@@ -1,67 +1,54 @@
 """
 soundboard.py
-Manages loading mp3s into numpy arrays and playing them mixed into the
-outgoing audio stream. Uses pydub (ffmpeg) purely for DECODING, then does
-our own high-quality resampling with scipy.signal.resample_poly instead of
-relying on pydub's built-in frame rate conversion (a crude linear
-interpolation resampler that causes audible wobble).
+Plays MP3 soundboard clips by opening a dedicated sounddevice OutputStream
+DIRECTLY to the virtual cable device, at the file's own native sample rate
+and channel count. This lets Windows' own WASAPI shared-mode audio engine
+handle sample-rate conversion and mixing with the mic passthrough stream,
+instead of us doing our own resampling/mixing in Python.
 
-NOTE: an earlier version of this file had a "safety cap" that fell back to
-a cheap interpolation resampler whenever the up/down conversion factors
-were "too large". Unfortunately the single most common real-world case --
-44100 Hz (typical mp3) -> 48000 Hz (typical virtual cable rate) -- reduces
-to up=160, down=147, which tripped that cap every time. That meant the
-high-quality resampler was silently never actually used, and the same
-wobble bug persisted. The cap has been removed: resample_poly is only run
-once per unique file (result is cached), so there's no real performance
-concern even with larger factors (a full 3-minute song resamples in well
-under half a second, one time only).
+This is what actually fixes the "wobbly after a few seconds" MP3 bug for
+good -- WASAPI shared mode natively supports multiple simultaneous streams
+to the same device (this is how e.g. Discord + a game + a Windows
+notification sound can all play through the same speaker at once), so mic
+passthrough and soundboard playback mix together correctly at the OS
+level with zero custom resampling code required.
 
-Playback is tracked per sound_id so that pressing Play again on a sound
-that's already playing RESTARTS it instead of stacking a second overlapping
-copy (which previously caused phasing artifacts).
+Each sound plays on a short-lived independent stream that closes itself
+automatically when the clip finishes. Pressing Play again on a sound
+that's already playing restarts it (stops the old stream, starts a fresh
+one) instead of stacking an overlapping copy.
 """
 
-import math
+import threading
+import uuid
 import numpy as np
+import sounddevice as sd
 from pydub import AudioSegment
 from pathlib import Path
-import threading
+
+from effects import GainEffect, DeepFryEffect
 
 
-def _high_quality_resample(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
-    """Resample (frames, channels) float32 audio from src_rate to dst_rate
-    using a proper polyphase filter (scipy.signal.resample_poly). Always
-    used regardless of the size of the up/down factors -- this only runs
-    once per unique file (cached afterward), so it's cheap enough even for
-    "unfriendly" rate ratios like 44100->48000 (up=160, down=147)."""
-    if src_rate == dst_rate:
-        return samples
+class _ActiveClip:
+    __slots__ = ("key", "stream")
 
-    from scipy.signal import resample_poly
-
-    g = math.gcd(src_rate, dst_rate)
-    up = dst_rate // g
-    down = src_rate // g
-
-    resampled_channels = [
-        resample_poly(samples[:, ch], up, down)
-        for ch in range(samples.shape[1])
-    ]
-    out = np.stack(resampled_channels, axis=1).astype(np.float32)
-    return out
+    def __init__(self, key, stream):
+        self.key = key
+        self.stream = stream
 
 
 class SoundboardPlayer:
-    def __init__(self, samplerate: int = 48000, channels: int = 2):
-        self.samplerate = samplerate
-        self.channels = channels
+    def __init__(self):
         self._lock = threading.Lock()
-        self._active_clips = []
+        self._active = {}
         self._cache = {}
+        self.output_device = None
 
-    def _decode(self, filepath: Path) -> np.ndarray:
-        key = (str(filepath), self.samplerate, self.channels)
+        self.gain = GainEffect(enabled=True, gain_db=0.0)
+        self.deep_fry = DeepFryEffect(enabled=False)
+
+    def _decode(self, filepath: Path):
+        key = str(filepath)
         if key in self._cache:
             return self._cache[key]
 
@@ -77,63 +64,128 @@ class SoundboardPlayer:
         else:
             samples = samples.reshape((-1, 1))
 
-        if native_channels != self.channels:
-            if native_channels == 1 and self.channels == 2:
-                samples = np.repeat(samples, 2, axis=1)
-            elif native_channels == 2 and self.channels == 1:
-                samples = samples.mean(axis=1, keepdims=True)
-            else:
-                fixed = np.zeros((samples.shape[0], self.channels), dtype=np.float32)
-                n = min(samples.shape[1], self.channels)
-                fixed[:, :n] = samples[:, :n]
-                samples = fixed
+        samples = np.ascontiguousarray(samples)
+        self._cache[key] = (samples, native_rate, native_channels)
+        return self._cache[key]
 
-        if native_rate != self.samplerate:
-            samples = _high_quality_resample(samples, native_rate, self.samplerate)
+    def _resolve_playback_channels(self, native_channels: int) -> int:
+        try:
+            info = sd.query_devices(self.output_device)
+            max_out = int(info.get("max_output_channels", native_channels) or native_channels)
+        except Exception:
+            max_out = native_channels
 
-        samples = np.ascontiguousarray(samples.astype(np.float32))
-        self._cache[key] = samples
-        return samples
+        if max_out <= 0:
+            return native_channels
+        if native_channels == 1 and max_out >= 2:
+            return 2
+        return min(native_channels, max_out)
+
+    @staticmethod
+    def _convert_channels(samples: np.ndarray, native_channels: int, target_channels: int) -> np.ndarray:
+        if native_channels == target_channels:
+            return samples
+        if native_channels == 1 and target_channels == 2:
+            return np.repeat(samples, 2, axis=1)
+        if native_channels == 2 and target_channels == 1:
+            return samples.mean(axis=1, keepdims=True)
+        fixed = np.zeros((samples.shape[0], target_channels), dtype=np.float32)
+        n = min(samples.shape[1], target_channels)
+        fixed[:, :n] = samples[:, :n]
+        return fixed
 
     def play(self, filepath: Path, volume: float = 1.0, sound_id: str = None):
-        audio = self._decode(filepath)
+        samples, native_rate, native_channels = self._decode(filepath)
+
+        key = sound_id if sound_id is not None else str(uuid.uuid4())
+        if sound_id is not None:
+            self.stop_sound(sound_id)
+
+        playback_channels = self._resolve_playback_channels(native_channels)
+        data = self._convert_channels(samples, native_channels, playback_channels)
+
+        pos = {"i": 0}
+
+        def callback(outdata, frames, time_info, status):
+            start = pos["i"]
+            end = start + frames
+            chunk = data[start:end]
+
+            finished = False
+            if len(chunk) < frames:
+                fixed = np.zeros((frames, playback_channels), dtype=np.float32)
+                fixed[:len(chunk)] = chunk
+                chunk = fixed
+                finished = True
+
+            processed = chunk * volume
+            with self._lock:
+                processed = self.gain.process(processed, native_rate)
+                if self.deep_fry.enabled:
+                    processed = self.deep_fry.process(processed, native_rate)
+
+            outdata[:] = np.clip(processed, -1.0, 1.0)
+            pos["i"] = end
+
+            if finished:
+                raise sd.CallbackStop()
+
+        stream = sd.OutputStream(
+            device=self.output_device,
+            channels=playback_channels,
+            samplerate=native_rate,
+            dtype="float32",
+            callback=callback,
+            finished_callback=lambda k=key: self._on_finished(k),
+        )
+
         with self._lock:
-            if sound_id is not None:
-                self._active_clips = [c for c in self._active_clips if c["id"] != sound_id]
-            self._active_clips.append({
-                "id": sound_id,
-                "audio": audio,
-                "pos": 0,
-                "volume": volume
-            })
+            self._active[key] = _ActiveClip(key, stream)
+
+        stream.start()
+
+    def _on_finished(self, key):
+        with self._lock:
+            clip = self._active.pop(key, None)
+        if clip is not None:
+            try:
+                clip.stream.close()
+            except Exception:
+                pass
+
+    def stop_sound(self, sound_id):
+        with self._lock:
+            clip = self._active.pop(sound_id, None)
+        if clip is not None:
+            try:
+                clip.stream.stop()
+                clip.stream.close()
+            except Exception:
+                pass
 
     def stop_all(self):
         with self._lock:
-            self._active_clips.clear()
-
-    def stop_sound(self, sound_id: str):
-        with self._lock:
-            self._active_clips = [c for c in self._active_clips if c["id"] != sound_id]
+            clips = list(self._active.values())
+            self._active.clear()
+        for clip in clips:
+            try:
+                clip.stream.stop()
+                clip.stream.close()
+            except Exception:
+                pass
 
     def is_playing(self) -> bool:
         with self._lock:
-            return len(self._active_clips) > 0
+            return len(self._active) > 0
 
-    def read_block(self, num_frames: int) -> np.ndarray:
-        out = np.zeros((num_frames, self.channels), dtype=np.float32)
+    def set_gain_db(self, gain_db: float):
         with self._lock:
-            still_active = []
-            for clip in self._active_clips:
-                audio = clip["audio"]
-                pos = clip["pos"]
-                remaining = len(audio) - pos
-                take = min(num_frames, remaining)
-                if take > 0:
-                    out[:take] += audio[pos:pos + take] * clip["volume"]
-                    clip["pos"] += take
-                if clip["pos"] < len(audio):
-                    still_active.append(clip)
-            self._active_clips = still_active
+            self.gain.params["gain_db"] = gain_db
 
-        np.clip(out, -1.0, 1.0, out=out)
-        return out
+    def set_deep_fry_enabled(self, enabled: bool):
+        with self._lock:
+            self.deep_fry.enabled = enabled
+
+    def update_deep_fry_params(self, **kwargs):
+        with self._lock:
+            self.deep_fry.params.update(kwargs)
