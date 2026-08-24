@@ -1,22 +1,27 @@
 """
 soundboard.py
-Decodes and caches MP3s (resampled ONCE to the live output stream's actual
-rate/channels using a proper polyphase resampler), then exposes a
-read_block() method that the single output audio callback in
+Decodes and caches MP3/WAV files (resampled ONCE to the live output
+stream's actual rate/channels using a proper polyphase resampler), then
+exposes a read_block() method that the single output audio callback in
 audio_engine.py calls to mix soundboard playback directly into the same
 stream as mic passthrough.
 
+DEFENSIVE DECODING: some encoders/tools (including several online tone
+generators) produce WAV files with slightly nonstandard headers or an
+incomplete trailing frame. If we blindly trust the reported channel count
+and force-reshape the decoded sample array into that many channels, an
+odd/mismatched total sample count causes either a hard crash ("cannot
+reshape array of size X into shape (2)") or, worse, silent channel
+misalignment that can sound like garbling/wobbling. We now verify the
+total sample count actually divides evenly by the reported channel count,
+and trim any leftover partial frame before reshaping, so this is always
+safe regardless of how the source file was encoded.
+
 WHY A SINGLE SHARED OUTPUT STREAM (not one stream per sound):
-Python has a Global Interpreter Lock (GIL) -- only one thread can execute
-Python bytecode at a time, even across separate audio callback threads.
-Opening a brand new independent PortAudio stream (with its own Python
-callback) for every sound played creates multiple competing real-time
-audio threads, all fighting for the same lock roughly every ~20ms. When
-one callback is busy (e.g. the mic's effects chain), others can miss their
-audio deadline, causing exactly the kind of jittery/choppy dropout
-artifact that sounds like "wobble". Mixing everything into ONE existing
-output callback avoids this entirely -- read_block() here is just cheap
-numpy array slicing/summation, no new threads, no GIL contention.
+Python's GIL means multiple independent real-time audio callback threads
+fight over the same lock roughly every ~20ms. Mixing soundboard playback
+into the SAME output callback that handles mic passthrough (via
+read_block(), cheap numpy slicing/summation) avoids that entirely.
 
 Playback is tracked per sound_id so pressing Play again on a sound that's
 already playing RESTARTS it instead of stacking an overlapping copy.
@@ -69,15 +74,29 @@ class SoundboardPlayer:
 
         seg = AudioSegment.from_file(filepath)
         native_rate = seg.frame_rate
-        native_channels = seg.channels
+        native_channels = max(1, seg.channels)
 
-        samples = np.array(seg.get_array_of_samples()).astype(np.float32)
-        samples /= (2 ** (8 * seg.sample_width - 1))
+        raw = np.array(seg.get_array_of_samples()).astype(np.float32)
+        raw /= (2 ** (8 * seg.sample_width - 1))
+
+        # DEFENSIVE: verify the total sample count actually divides evenly
+        # by the reported channel count. Some encoders (including certain
+        # online tone/WAV generators) produce files with a slightly
+        # nonstandard header or an incomplete trailing frame, which can
+        # cause a mismatch here. If we blindly reshape anyway, it either
+        # crashes ("cannot reshape array of size X into shape (N)") or
+        # silently misaligns channels, which can sound like
+        # garbling/wobbling rather than throwing a clear error. Instead,
+        # trim any leftover partial frame so the reshape always succeeds
+        # correctly.
+        remainder = len(raw) % native_channels
+        if remainder != 0:
+            raw = raw[:len(raw) - remainder]
 
         if native_channels > 1:
-            samples = samples.reshape((-1, native_channels))
+            samples = raw.reshape((-1, native_channels))
         else:
-            samples = samples.reshape((-1, 1))
+            samples = raw.reshape((-1, 1))
 
         if native_channels != self.channels:
             if native_channels == 1 and self.channels == 2:
@@ -122,8 +141,6 @@ class SoundboardPlayer:
             return len(self._active_clips) > 0
 
     def read_block(self, num_frames: int) -> np.ndarray:
-        """Called from the single shared output audio callback. Cheap
-        array slicing/summation only -- no resampling, no new threads."""
         out = np.zeros((num_frames, self.channels), dtype=np.float32)
         with self._lock:
             still_active = []
