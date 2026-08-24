@@ -2,24 +2,21 @@
 audio_engine.py
 Real-time audio engine.
 
-Two streams total: one InputStream (mic) and one OutputStream (virtual
-cable), with the soundboard mixed directly into the output callback (no
-extra threads/streams -- see soundboard.py for why).
-
-IMPORTANT -- BUFFER UNDERRUNS ("sudden quiet / sounds like background"):
-Every audio callback must return within one block's time budget (with the
-previous 1024-sample block size, that's only ~21ms at 48kHz). If Python
-occasionally takes even slightly longer than that -- due to normal
-interpreter overhead, a garbage collection pause, or a brief CPU spike from
-something else running on the PC -- the driver conceals the missed
-deadline with silence or stale audio for an instant. That's heard as a
-sudden, brief volume dip / "distant" sounding artifact, distinct from the
-resampling/threading issues fixed earlier. This is a classic real-time
-audio underrun, and the standard fix is to give the callback a bigger time
-budget: a larger block size, and explicitly requesting "high latency" mode
-from WASAPI so Windows allocates bigger internal buffers. This trades a
-small amount of extra fixed delay (roughly +50-100ms) for much more
-headroom against these dropouts.
+CRITICAL FIX: previous versions forced a fixed blocksize (1024, then 2048)
+on both streams. WASAPI internally wants to deliver audio using its own
+"native period size" for your specific sound driver, which is often NOT
+whatever value we force, and can vary. Forcing a mismatched blocksize
+makes PortAudio do its own internal re-buffering/re-chunking behind the
+scenes to reconcile the mismatch -- this is a well-documented cause of
+intermittent glitching/pulsing with sounddevice on Windows WASAPI, and it
+happens at a layer below our own code, which is why no amount of DSP,
+threading, or buffer-size tuning ever fixed it. The fix is to NOT force a
+blocksize at all (blocksize=0) so PortAudio/WASAPI auto-negotiates the
+ideal buffer size for the actual device. Our code already reads the
+`frames` argument dynamically in every callback, and ElasticBuffer /
+soundboard.read_block() already accept a variable frame count per call, so
+this requires no other changes to work correctly with variable block
+sizes.
 """
 
 import sounddevice as sd
@@ -29,8 +26,10 @@ import threading
 from effects import EffectChain
 from soundboard import SoundboardPlayer
 
-BLOCK_SIZE = 2048          # larger block = more time budget per callback
-STREAM_LATENCY = "high"    # ask WASAPI for bigger internal buffers
+BLOCK_SIZE = 0             # 0 = let PortAudio/WASAPI auto-negotiate the
+                            # device's native period size instead of
+                            # forcing a mismatched size (root cause fix)
+STREAM_LATENCY = "high"    # still ask for generous buffering headroom
 DEFAULT_SAMPLE_RATE = 48000
 DEFAULT_CHANNELS = 2
 
