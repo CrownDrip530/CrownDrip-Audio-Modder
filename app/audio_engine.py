@@ -2,18 +2,22 @@
 audio_engine.py
 Real-time audio engine.
 
-Mic passthrough: captures your real mic, runs it through the EffectChain,
-and streams it out to the virtual cable device via an ElasticBuffer that
-bridges the two independently-clocked devices smoothly (no audible warble
-from clock drift).
+Two streams total, ever:
+  - one InputStream for the mic (captures + runs EffectChain)
+  - one OutputStream to the virtual cable (mixes mic passthrough + soundboard)
 
-Soundboard (MP3) playback: handled entirely by soundboard.py, which opens
-its OWN short-lived stream(s) directly to the virtual cable device at each
-file's native rate. Windows' WASAPI shared-mode audio engine natively
-mixes multiple simultaneous streams to the same device, so this plays
-alongside mic passthrough correctly with zero custom resampling/mixing
-code on our end -- this is what actually fixed the "wobbly after a few
-seconds" mp3 bug for good, versus manually resampling/mixing it ourselves.
+The soundboard is NOT given its own separate stream/thread. Python's GIL
+means multiple independent real-time audio callback threads fight over the
+same lock roughly every ~20ms; giving every mp3 its own stream caused
+audible choppy dropout artifacts (mistaken for "wobble") from thread
+contention. Instead, SoundboardPlayer.read_block() is called directly
+inside the SAME output callback that handles mic passthrough -- it's just
+cheap numpy slicing/summation, no new threads involved.
+
+The mic input and cable output streams still run on independent hardware
+clocks that drift apart over time, which is bridged by ElasticBuffer
+(gentle speed up/down via linear interpolation, well under audible
+threshold) rather than abrupt block drop/repeat.
 """
 
 import sounddevice as sd
@@ -90,12 +94,13 @@ class AudioEngine:
         self.monitor_enabled = False
 
         self.chain = EffectChain()
-        self.soundboard = SoundboardPlayer()
 
         self.input_rate = DEFAULT_SAMPLE_RATE
         self.output_rate = DEFAULT_SAMPLE_RATE
         self.input_channels = DEFAULT_CHANNELS
         self.output_channels = DEFAULT_CHANNELS
+
+        self.soundboard = SoundboardPlayer(samplerate=DEFAULT_SAMPLE_RATE, channels=DEFAULT_CHANNELS)
 
         self._input_stream = None
         self._output_stream = None
@@ -161,7 +166,23 @@ class AudioEngine:
             block = self._elastic.read(frames)
         else:
             block = np.zeros((frames, self.output_channels), dtype=np.float32)
-        outdata[:] = np.clip(block, -1.0, 1.0)
+
+        sb_block = self.soundboard.read_block(frames)
+
+        mixed = block + sb_block
+        mixed = self._soft_limit(mixed)
+        outdata[:] = mixed
+
+    @staticmethod
+    def _soft_limit(x: np.ndarray, threshold: float = 0.8) -> np.ndarray:
+        out = np.copy(x)
+        over_mask = np.abs(x) > threshold
+        if np.any(over_mask):
+            sign = np.sign(x[over_mask])
+            excess = np.abs(x[over_mask]) - threshold
+            compressed = threshold + (1.0 - threshold) * np.tanh(excess / (1.0 - threshold))
+            out[over_mask] = sign * compressed
+        return np.clip(out, -1.0, 1.0)
 
     def start(self):
         if self._running:
@@ -196,9 +217,16 @@ class AudioEngine:
         self.input_rate = int(round(self._input_stream.samplerate))
         self.output_rate = int(round(self._output_stream.samplerate))
 
-        self._elastic = ElasticBuffer(channels=self.output_channels, samplerate=self.output_rate)
+        old_gain_db = self.soundboard.gain.params.get("gain_db", 0.0)
+        old_fry_enabled = self.soundboard.deep_fry.enabled
+        old_fry_params = dict(self.soundboard.deep_fry.params)
 
-        self.soundboard.output_device = self.output_device
+        self.soundboard = SoundboardPlayer(samplerate=self.output_rate, channels=self.output_channels)
+        self.soundboard.gain.params["gain_db"] = old_gain_db
+        self.soundboard.deep_fry.enabled = old_fry_enabled
+        self.soundboard.deep_fry.params.update(old_fry_params)
+
+        self._elastic = ElasticBuffer(channels=self.output_channels, samplerate=self.output_rate)
 
         self._input_stream.start()
         self._output_stream.start()
@@ -242,8 +270,6 @@ class AudioEngine:
         self.soundboard.update_deep_fry_params(**kwargs)
 
     def play_sound(self, filepath, volume=1.0, sound_id=None):
-        if self.soundboard.output_device is None:
-            self.soundboard.output_device = self.output_device
         self.soundboard.play(filepath, volume, sound_id=sound_id)
 
     def stop_sound(self, sound_id):
