@@ -1,22 +1,6 @@
 """
 audio_engine.py
 Real-time audio engine.
-
-CRITICAL FIX: previous versions forced a fixed blocksize (1024, then 2048)
-on both streams. WASAPI internally wants to deliver audio using its own
-"native period size" for your specific sound driver, which is often NOT
-whatever value we force, and can vary. Forcing a mismatched blocksize
-makes PortAudio do its own internal re-buffering/re-chunking behind the
-scenes to reconcile the mismatch -- this is a well-documented cause of
-intermittent glitching/pulsing with sounddevice on Windows WASAPI, and it
-happens at a layer below our own code, which is why no amount of DSP,
-threading, or buffer-size tuning ever fixed it. The fix is to NOT force a
-blocksize at all (blocksize=0) so PortAudio/WASAPI auto-negotiates the
-ideal buffer size for the actual device. Our code already reads the
-`frames` argument dynamically in every callback, and ElasticBuffer /
-soundboard.read_block() already accept a variable frame count per call, so
-this requires no other changes to work correctly with variable block
-sizes.
 """
 
 import sounddevice as sd
@@ -26,15 +10,12 @@ import threading
 from effects import EffectChain
 from soundboard import SoundboardPlayer
 
-BLOCK_SIZE = 0             # 0 = let PortAudio/WASAPI auto-negotiate the
-                            # device's native period size instead of
-                            # forcing a mismatched size (root cause fix)
-STREAM_LATENCY = "high"    # still ask for generous buffering headroom
+BLOCK_SIZE = 1024
 DEFAULT_SAMPLE_RATE = 48000
 DEFAULT_CHANNELS = 2
 
-TARGET_LATENCY_SEC = 0.18
-MAX_LATENCY_SEC = 0.8
+TARGET_LATENCY_SEC = 0.15
+MAX_LATENCY_SEC = 0.6
 
 
 def _get_wasapi_hostapi_index():
@@ -63,7 +44,6 @@ class ElasticBuffer:
     def read(self, num_frames: int) -> np.ndarray:
         with self._lock:
             available = len(self._data)
-
             if available < 4:
                 return np.zeros((num_frames, self.channels), dtype=np.float32)
 
@@ -109,7 +89,11 @@ class AudioEngine:
         self._lock = threading.Lock()
         self._running = False
         self._elastic = None
-        self.xrun_count = 0
+
+        # Real diagnostics instead of guessing -- these are shown in the
+        # GUI status bar so we can see actual dropout counts.
+        self.input_xruns = 0
+        self.output_xruns = 0
 
     @staticmethod
     def list_input_devices():
@@ -147,7 +131,7 @@ class AudioEngine:
 
     def _input_callback(self, indata, frames, time_info, status):
         if status:
-            self.xrun_count += 1
+            self.input_xruns += 1
 
         with self._lock:
             mic_signal = indata.copy()
@@ -169,7 +153,7 @@ class AudioEngine:
 
     def _output_callback(self, outdata, frames, time_info, status):
         if status:
-            self.xrun_count += 1
+            self.output_xruns += 1
 
         if self._elastic is not None:
             block = self._elastic.read(frames)
@@ -197,7 +181,8 @@ class AudioEngine:
         if self._running:
             return
 
-        self.xrun_count = 0
+        self.input_xruns = 0
+        self.output_xruns = 0
 
         mic_info = self._get_device_info(self.mic_device)
         out_info = self._get_device_info(self.output_device)
@@ -214,7 +199,6 @@ class AudioEngine:
             samplerate=requested_input_rate,
             blocksize=BLOCK_SIZE,
             dtype="float32",
-            latency=STREAM_LATENCY,
             callback=self._input_callback,
         )
         self._output_stream = sd.OutputStream(
@@ -223,7 +207,6 @@ class AudioEngine:
             samplerate=requested_output_rate,
             blocksize=BLOCK_SIZE,
             dtype="float32",
-            latency=STREAM_LATENCY,
             callback=self._output_callback,
         )
 
