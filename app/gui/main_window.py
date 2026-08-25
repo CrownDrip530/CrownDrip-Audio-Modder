@@ -301,7 +301,12 @@ class MainWindow(QMainWindow):
         filepath = cfg.get_sound_path(entry)
         try:
             self.engine.play_sound(filepath, entry.get("volume", 1.0), sound_id=entry["id"])
-            self.status.showMessage(f"Playing: {entry['name']}")
+            info = self.engine.soundboard.get_last_decode_info()
+            self.status.showMessage(
+                f"Playing: {entry['name']} | file={info['native_rate']}Hz/{info['native_channels']}ch "
+                f"-> device={info['device_rate']}Hz/{info['device_channels']}ch | "
+                f"in_xruns={self.engine.input_xruns} out_xruns={self.engine.output_xruns}"
+            )
         except Exception as e:
             QMessageBox.critical(self, "Playback error", str(e))
 
