@@ -2,18 +2,24 @@
 audio_engine.py
 Real-time audio engine.
 
-QUICK FIX: previous versions forced the output stream to always open at
-the device's reported "default" rate (typically 48000Hz), requiring every
-non-48000 file (e.g. a typical 44100Hz WAV/MP3) to go through our
-resampler. Diagnostics confirmed zero buffer xruns/underruns, which rules
-out timing/buffering as the wobble's cause -- leaving the resample step
-itself as the last real suspect. Instead of debugging that further, we
-now try opening the output stream at the FILE's own native rate first
-(no resampling needed at all if it succeeds), only falling back to the
-device's default rate (with resampling) if the device rejects that rate.
-This removes resampling from the picture entirely for the common case.
+Two streams: one InputStream (mic) and one OutputStream (virtual cable),
+with the soundboard mixed directly into the output callback.
+
+GARBAGE COLLECTOR FIX: diagnostics confirmed zero reported xruns/
+underruns from PortAudio/WASAPI even while audio audibly wobbled, and
+neither block size nor latency mode changes fixed it. This points to
+Python's cyclic garbage collector -- it can pause execution for a few
+milliseconds at unpredictable times to run a GC sweep. Inside a real-time
+audio callback that must return within a strict ~20ms window, even a
+brief GC pause causes an audible glitch. Critically, many WASAPI/
+PortAudio shared-mode configurations do NOT reliably report these pauses
+as "xruns", which is exactly why our xrun counters stayed at 0 despite
+audible wobble. Disabling the GC while streaming (and re-enabling +
+forcing a collection on stop) is a standard, well-documented mitigation
+for real-time audio in Python.
 """
 
+import gc
 import sounddevice as sd
 import numpy as np
 import threading
@@ -242,9 +248,6 @@ class AudioEngine:
             callback=self._input_callback,
         )
 
-        # Try 44100 first (no resampling needed for the most common file
-        # rate), only falling back to the device's default (with
-        # resampling) if 44100 is rejected.
         self._output_stream = self._open_output_stream(self.output_channels)
 
         self.input_rate = int(round(self._input_stream.samplerate))
@@ -265,6 +268,13 @@ class AudioEngine:
         self._output_stream.start()
         self._running = True
 
+        # Disable Python's cyclic garbage collector while streaming. GC
+        # pauses (even a few ms) inside a real-time audio callback cause
+        # glitches that many WASAPI/PortAudio shared-mode configurations
+        # do NOT reliably report as "xruns" -- which is why our xrun
+        # counters showed 0 despite audible wobble.
+        gc.disable()
+
     def stop(self):
         if self._input_stream is not None:
             self._input_stream.stop()
@@ -277,6 +287,9 @@ class AudioEngine:
         self._elastic = None
         self._running = False
         self.soundboard.stop_all()
+
+        gc.enable()
+        gc.collect()
 
     def is_running(self):
         return self._running
