@@ -1,6 +1,17 @@
 """
 audio_engine.py
 Real-time audio engine.
+
+QUICK FIX: previous versions forced the output stream to always open at
+the device's reported "default" rate (typically 48000Hz), requiring every
+non-48000 file (e.g. a typical 44100Hz WAV/MP3) to go through our
+resampler. Diagnostics confirmed zero buffer xruns/underruns, which rules
+out timing/buffering as the wobble's cause -- leaving the resample step
+itself as the last real suspect. Instead of debugging that further, we
+now try opening the output stream at the FILE's own native rate first
+(no resampling needed at all if it succeeds), only falling back to the
+device's default rate (with resampling) if the device rejects that rate.
+This removes resampling from the picture entirely for the common case.
 """
 
 import sounddevice as sd
@@ -16,6 +27,10 @@ DEFAULT_CHANNELS = 2
 
 TARGET_LATENCY_SEC = 0.15
 MAX_LATENCY_SEC = 0.6
+
+# Common rates to try, in priority order, before falling back to the
+# device's own reported default. 44100 is the most common file rate.
+CANDIDATE_OUTPUT_RATES = [44100, 48000]
 
 
 def _get_wasapi_hostapi_index():
@@ -90,8 +105,6 @@ class AudioEngine:
         self._running = False
         self._elastic = None
 
-        # Real diagnostics instead of guessing -- these are shown in the
-        # GUI status bar so we can see actual dropout counts.
         self.input_xruns = 0
         self.output_xruns = 0
 
@@ -177,6 +190,34 @@ class AudioEngine:
             out[over_mask] = sign * compressed
         return np.clip(out, -1.0, 1.0)
 
+    def _open_output_stream(self, device_channels):
+        """Try opening the output stream at each candidate rate in order
+        (44100 first, since that's the most common file rate) before
+        falling back to the device's own reported default. Returns the
+        opened stream, or raises the last error if nothing worked."""
+        out_info = self._get_device_info(self.output_device)
+        default_rate = int(round(out_info.get("default_samplerate", DEFAULT_SAMPLE_RATE)))
+
+        rates_to_try = [r for r in CANDIDATE_OUTPUT_RATES if r != default_rate] + [default_rate]
+
+        last_error = None
+        for rate in rates_to_try:
+            try:
+                stream = sd.OutputStream(
+                    device=self.output_device,
+                    channels=device_channels,
+                    samplerate=rate,
+                    blocksize=BLOCK_SIZE,
+                    dtype="float32",
+                    callback=self._output_callback,
+                )
+                return stream
+            except Exception as e:
+                last_error = e
+                continue
+
+        raise last_error if last_error else RuntimeError("Could not open output stream at any candidate rate")
+
     def start(self):
         if self._running:
             return
@@ -188,7 +229,6 @@ class AudioEngine:
         out_info = self._get_device_info(self.output_device)
 
         requested_input_rate = int(round(mic_info.get("default_samplerate", DEFAULT_SAMPLE_RATE)))
-        requested_output_rate = int(round(out_info.get("default_samplerate", DEFAULT_SAMPLE_RATE)))
 
         self.input_channels = max(1, min(2, mic_info.get("max_input_channels", 1)))
         self.output_channels = max(1, min(2, out_info.get("max_output_channels", 2)))
@@ -201,14 +241,11 @@ class AudioEngine:
             dtype="float32",
             callback=self._input_callback,
         )
-        self._output_stream = sd.OutputStream(
-            device=self.output_device,
-            channels=self.output_channels,
-            samplerate=requested_output_rate,
-            blocksize=BLOCK_SIZE,
-            dtype="float32",
-            callback=self._output_callback,
-        )
+
+        # Try 44100 first (no resampling needed for the most common file
+        # rate), only falling back to the device's default (with
+        # resampling) if 44100 is rejected.
+        self._output_stream = self._open_output_stream(self.output_channels)
 
         self.input_rate = int(round(self._input_stream.samplerate))
         self.output_rate = int(round(self._output_stream.samplerate))
