@@ -1,45 +1,35 @@
 """
 soundboard.py
-Decodes and caches MP3/WAV files (resampled ONCE to the live output
-stream's actual rate/channels using a proper polyphase resampler), then
-exposes a read_block() method that the single output audio callback in
-audio_engine.py calls to mix soundboard playback directly into the same
-stream as mic passthrough.
+Decodes and caches MP3/WAV files, then exposes read_block() for mixing
+into the shared output audio callback.
 
-DEFENSIVE DECODING: some encoders/tools (including several online tone
-generators) produce WAV files with slightly nonstandard headers or an
-incomplete trailing frame. If we blindly trust the reported channel count
-and force-reshape the decoded sample array into that many channels, an
-odd/mismatched total sample count causes either a hard crash ("cannot
-reshape array of size X into shape (2)") or, worse, silent channel
-misalignment that can sound like garbling/wobbling. We now verify the
-total sample count actually divides evenly by the reported channel count,
-and trim any leftover partial frame before reshaping, so this is always
-safe regardless of how the source file was encoded.
-
-WHY A SINGLE SHARED OUTPUT STREAM (not one stream per sound):
-Python's GIL means multiple independent real-time audio callback threads
-fight over the same lock roughly every ~20ms. Mixing soundboard playback
-into the SAME output callback that handles mic passthrough (via
-read_block(), cheap numpy slicing/summation) avoids that entirely.
-
-Playback is tracked per sound_id so pressing Play again on a sound that's
-already playing RESTARTS it instead of stacking an overlapping copy.
+IMPORTANT CHANGE: WAV files are now decoded using Python's built-in `wave`
+module instead of pydub/ffmpeg. Previously, EVERY file (including WAV)
+went through pydub, which launches ffmpeg.exe as an external subprocess to
+decode. This explains two things: (1) a briefly flashing console window
+before playback (ffmpeg's console window on Windows, since it isn't told
+to run hidden), and (2) a real multi-second delay before a new file plays
+(ffmpeg process startup + decode time). It also means any instability in
+that external ffmpeg process (Windows scheduling delays, pipe I/O
+hiccups) could introduce irregularities into the decoded audio BEFORE our
+own resampling/mixing code ever touches it -- which would explain why
+fixes to resampling/buffering never fully resolved the wobble. Using
+Python's built-in wave module for .wav files removes ffmpeg from the path
+entirely for that format: no subprocess, no console flash, near-instant
+decode, and one less variable in the pipeline. MP3s still require pydub/
+ffmpeg since there's no pure-Python MP3 decoder built in.
 """
 
 import math
+import wave
 import threading
 import numpy as np
-from pydub import AudioSegment
 from pathlib import Path
 
 from effects import GainEffect, DeepFryEffect
 
 
 def _high_quality_resample(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
-    """Resample (frames, channels) float32 audio using scipy's polyphase
-    filter (resample_poly). Runs once per unique (file, rate) combo, then
-    cached -- negligible cost even for ratios like 44100->48000."""
     if src_rate == dst_rate:
         return samples
 
@@ -54,6 +44,61 @@ def _high_quality_resample(samples: np.ndarray, src_rate: int, dst_rate: int) ->
         for ch in range(samples.shape[1])
     ]
     return np.stack(resampled_channels, axis=1).astype(np.float32)
+
+
+def _decode_wav_native(filepath: Path):
+    """Decode a .wav file using Python's built-in wave module -- no
+    ffmpeg subprocess involved at all."""
+    with wave.open(str(filepath), 'rb') as wf:
+        n_channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        framerate = wf.getframerate()
+        n_frames = wf.getnframes()
+        raw_bytes = wf.readframes(n_frames)
+
+    if sample_width == 1:
+        dtype = np.uint8
+        samples = np.frombuffer(raw_bytes, dtype=dtype).astype(np.float32)
+        samples = (samples - 128) / 128.0
+    elif sample_width == 2:
+        dtype = np.int16
+        samples = np.frombuffer(raw_bytes, dtype=dtype).astype(np.float32) / 32768.0
+    elif sample_width == 4:
+        dtype = np.int32
+        samples = np.frombuffer(raw_bytes, dtype=dtype).astype(np.float32) / 2147483648.0
+    else:
+        raise ValueError(f"Unsupported WAV sample width: {sample_width}")
+
+    remainder = len(samples) % n_channels
+    if remainder != 0:
+        samples = samples[:len(samples) - remainder]
+
+    samples = samples.reshape((-1, n_channels))
+    return samples, framerate, n_channels
+
+
+def _decode_via_pydub(filepath: Path):
+    """Fallback decoder for non-WAV formats (mp3, ogg, etc.) that still
+    require ffmpeg via pydub."""
+    from pydub import AudioSegment
+
+    seg = AudioSegment.from_file(filepath)
+    native_rate = seg.frame_rate
+    native_channels = max(1, seg.channels)
+
+    raw = np.array(seg.get_array_of_samples()).astype(np.float32)
+    raw /= (2 ** (8 * seg.sample_width - 1))
+
+    remainder = len(raw) % native_channels
+    if remainder != 0:
+        raw = raw[:len(raw) - remainder]
+
+    if native_channels > 1:
+        samples = raw.reshape((-1, native_channels))
+    else:
+        samples = raw.reshape((-1, 1))
+
+    return samples, native_rate, native_channels
 
 
 class SoundboardPlayer:
@@ -72,31 +117,10 @@ class SoundboardPlayer:
         if key in self._cache:
             return self._cache[key]
 
-        seg = AudioSegment.from_file(filepath)
-        native_rate = seg.frame_rate
-        native_channels = max(1, seg.channels)
-
-        raw = np.array(seg.get_array_of_samples()).astype(np.float32)
-        raw /= (2 ** (8 * seg.sample_width - 1))
-
-        # DEFENSIVE: verify the total sample count actually divides evenly
-        # by the reported channel count. Some encoders (including certain
-        # online tone/WAV generators) produce files with a slightly
-        # nonstandard header or an incomplete trailing frame, which can
-        # cause a mismatch here. If we blindly reshape anyway, it either
-        # crashes ("cannot reshape array of size X into shape (N)") or
-        # silently misaligns channels, which can sound like
-        # garbling/wobbling rather than throwing a clear error. Instead,
-        # trim any leftover partial frame so the reshape always succeeds
-        # correctly.
-        remainder = len(raw) % native_channels
-        if remainder != 0:
-            raw = raw[:len(raw) - remainder]
-
-        if native_channels > 1:
-            samples = raw.reshape((-1, native_channels))
+        if filepath.suffix.lower() == ".wav":
+            samples, native_rate, native_channels = _decode_wav_native(filepath)
         else:
-            samples = raw.reshape((-1, 1))
+            samples, native_rate, native_channels = _decode_via_pydub(filepath)
 
         if native_channels != self.channels:
             if native_channels == 1 and self.channels == 2:
