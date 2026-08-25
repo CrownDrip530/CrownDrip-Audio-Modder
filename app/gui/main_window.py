@@ -249,7 +249,11 @@ class MainWindow(QMainWindow):
             try:
                 self.engine.start()
                 self.start_btn.setText("\u25A0  Stop Routing")
-                self.status.showMessage(f"Routing live: mic -> {self.output_combo.currentText()}")
+                self.status.showMessage(
+                    f"Routing live: mic -> {self.output_combo.currentText()} | "
+                    f"exclusive_in={self.engine.input_exclusive_mode} "
+                    f"exclusive_out={self.engine.output_exclusive_mode}"
+                )
             except Exception as e:
                 QMessageBox.critical(self, "Failed to start", str(e))
             self._save()
@@ -305,6 +309,7 @@ class MainWindow(QMainWindow):
             self.status.showMessage(
                 f"Playing: {entry['name']} | file={info['native_rate']}Hz/{info['native_channels']}ch "
                 f"-> device={info['device_rate']}Hz/{info['device_channels']}ch | "
+                f"exclusive_out={self.engine.output_exclusive_mode} | "
                 f"in_xruns={self.engine.input_xruns} out_xruns={self.engine.output_xruns}"
             )
         except Exception as e:
