@@ -3,21 +3,14 @@ soundboard.py
 Decodes and caches MP3/WAV files, then exposes read_block() for mixing
 into the shared output audio callback.
 
-IMPORTANT CHANGE: WAV files are now decoded using Python's built-in `wave`
-module instead of pydub/ffmpeg. Previously, EVERY file (including WAV)
-went through pydub, which launches ffmpeg.exe as an external subprocess to
-decode. This explains two things: (1) a briefly flashing console window
-before playback (ffmpeg's console window on Windows, since it isn't told
-to run hidden), and (2) a real multi-second delay before a new file plays
-(ffmpeg process startup + decode time). It also means any instability in
-that external ffmpeg process (Windows scheduling delays, pipe I/O
-hiccups) could introduce irregularities into the decoded audio BEFORE our
-own resampling/mixing code ever touches it -- which would explain why
-fixes to resampling/buffering never fully resolved the wobble. Using
-Python's built-in wave module for .wav files removes ffmpeg from the path
-entirely for that format: no subprocess, no console flash, near-instant
-decode, and one less variable in the pipeline. MP3s still require pydub/
-ffmpeg since there's no pure-Python MP3 decoder built in.
+WAV files decode via Python's built-in `wave` module (no ffmpeg
+subprocess -- avoids the console-flash + multi-second delay problem).
+MP3/other formats still go through pydub/ffmpeg since there's no
+pure-Python MP3 decoder built in.
+
+Tracks the last file's native rate/channels vs the live device's
+rate/channels so the GUI can display real diagnostic info instead of
+guessing at causes.
 """
 
 import math
@@ -57,15 +50,12 @@ def _decode_wav_native(filepath: Path):
         raw_bytes = wf.readframes(n_frames)
 
     if sample_width == 1:
-        dtype = np.uint8
-        samples = np.frombuffer(raw_bytes, dtype=dtype).astype(np.float32)
+        samples = np.frombuffer(raw_bytes, dtype=np.uint8).astype(np.float32)
         samples = (samples - 128) / 128.0
     elif sample_width == 2:
-        dtype = np.int16
-        samples = np.frombuffer(raw_bytes, dtype=dtype).astype(np.float32) / 32768.0
+        samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
     elif sample_width == 4:
-        dtype = np.int32
-        samples = np.frombuffer(raw_bytes, dtype=dtype).astype(np.float32) / 2147483648.0
+        samples = np.frombuffer(raw_bytes, dtype=np.int32).astype(np.float32) / 2147483648.0
     else:
         raise ValueError(f"Unsupported WAV sample width: {sample_width}")
 
@@ -108,19 +98,32 @@ class SoundboardPlayer:
         self._lock = threading.Lock()
         self._active_clips = []
         self._cache = {}
+        self._decode_info_cache = {}  # cache_key -> (native_rate, native_channels)
 
         self.gain = GainEffect(enabled=True, gain_db=0.0)
         self.deep_fry = DeepFryEffect(enabled=False)
 
+        # Diagnostics: last decoded file's native format vs live device
+        # format, so the GUI can show real evidence instead of guesses.
+        self._last_native_rate = None
+        self._last_native_channels = None
+
     def _decode(self, filepath: Path) -> np.ndarray:
         key = (str(filepath), self.samplerate, self.channels)
+
         if key in self._cache:
+            native_rate, native_channels = self._decode_info_cache.get(key, (None, None))
+            self._last_native_rate = native_rate
+            self._last_native_channels = native_channels
             return self._cache[key]
 
         if filepath.suffix.lower() == ".wav":
             samples, native_rate, native_channels = _decode_wav_native(filepath)
         else:
             samples, native_rate, native_channels = _decode_via_pydub(filepath)
+
+        self._last_native_rate = native_rate
+        self._last_native_channels = native_channels
 
         if native_channels != self.channels:
             if native_channels == 1 and self.channels == 2:
@@ -138,6 +141,8 @@ class SoundboardPlayer:
 
         samples = np.ascontiguousarray(samples.astype(np.float32))
         self._cache[key] = samples
+        self._decode_info_cache[key] = (native_rate, native_channels)
+
         return samples
 
     def play(self, filepath: Path, volume: float = 1.0, sound_id: str = None):
@@ -198,3 +203,11 @@ class SoundboardPlayer:
     def update_deep_fry_params(self, **kwargs):
         with self._lock:
             self.deep_fry.params.update(kwargs)
+
+    def get_last_decode_info(self):
+        return {
+            "native_rate": self._last_native_rate,
+            "native_channels": self._last_native_channels,
+            "device_rate": self.samplerate,
+            "device_channels": self.channels,
+        }
