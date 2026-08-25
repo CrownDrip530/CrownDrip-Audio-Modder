@@ -4,13 +4,14 @@ Decodes and caches MP3/WAV files, then exposes read_block() for mixing
 into the shared output audio callback.
 
 WAV files decode via Python's built-in `wave` module (no ffmpeg
-subprocess -- avoids the console-flash + multi-second delay problem).
-MP3/other formats still go through pydub/ffmpeg since there's no
-pure-Python MP3 decoder built in.
+subprocess). MP3/other formats go through pydub/ffmpeg.
 
 Tracks the last file's native rate/channels vs the live device's
-rate/channels so the GUI can display real diagnostic info instead of
-guessing at causes.
+rate/channels so the GUI can display real diagnostic info.
+
+Skips gain/deep-fry processing entirely when nothing is playing, to cut
+unnecessary per-callback work (small optimization, helps reduce the
+chance of a callback running long).
 """
 
 import math
@@ -98,13 +99,11 @@ class SoundboardPlayer:
         self._lock = threading.Lock()
         self._active_clips = []
         self._cache = {}
-        self._decode_info_cache = {}  # cache_key -> (native_rate, native_channels)
+        self._decode_info_cache = {}
 
         self.gain = GainEffect(enabled=True, gain_db=0.0)
         self.deep_fry = DeepFryEffect(enabled=False)
 
-        # Diagnostics: last decoded file's native format vs live device
-        # format, so the GUI can show real evidence instead of guesses.
         self._last_native_rate = None
         self._last_native_channels = None
 
@@ -185,9 +184,10 @@ class SoundboardPlayer:
                     still_active.append(clip)
             self._active_clips = still_active
 
-            out = self.gain.process(out, self.samplerate)
-            if self.deep_fry.enabled:
-                out = self.deep_fry.process(out, self.samplerate)
+            if still_active:
+                out = self.gain.process(out, self.samplerate)
+                if self.deep_fry.enabled:
+                    out = self.deep_fry.process(out, self.samplerate)
 
         np.clip(out, -1.0, 1.0, out=out)
         return out
