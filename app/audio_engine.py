@@ -2,19 +2,13 @@
 audio_engine.py
 Real-time audio engine.
 
-WASAPI EXCLUSIVE MODE FIX: by default, Windows audio streams run in
-"shared mode" -- every app's audio gets funneled through Windows' own
-internal mixer/resampler engine before reaching the device. This shared
-mixer is a well-documented, commonly reported source of exactly this kind
-of intermittent wobble/glitch specifically with VB-Cable, independent of
-anything our own code does (which explains why block size, latency mode,
-resampler quality, threading architecture, and GC pausing fixes never
-fully resolved it -- none of those touch Windows' own shared mixer pass).
-The standard real-world fix is WASAPI Exclusive Mode: our app talks
-DIRECTLY to the driver, completely bypassing the shared mixer. We try
-opening both streams in exclusive mode first, and cleanly fall back to
-normal shared mode if exclusive mode isn't available (e.g. another app
-already has the device open, or the driver doesn't support it).
+IMPORTANT: WASAPI Exclusive Mode was tested as a fix for wobble, but it
+locks the device to ONE app at a time -- which breaks the actual use case
+here (Discord needs to read from CABLE Output at the same time our app
+writes to CABLE Input). Exclusive mode is now OFF by default; shared mode
+is used so Discord and this app can both use the virtual cable
+simultaneously, which is required for the app to actually work as
+intended.
 """
 
 import gc
@@ -34,6 +28,11 @@ MAX_LATENCY_SEC = 0.6
 
 CANDIDATE_OUTPUT_RATES = [44100, 48000]
 
+# Exclusive mode locks the device to one app at a time -- incompatible
+# with feeding Discord (which needs simultaneous access to CABLE Output).
+# Kept as an option for future non-Discord use cases, but off by default.
+USE_EXCLUSIVE_MODE = False
+
 
 def _get_wasapi_hostapi_index():
     for i, api in enumerate(sd.query_hostapis()):
@@ -43,9 +42,6 @@ def _get_wasapi_hostapi_index():
 
 
 def _wasapi_exclusive_settings():
-    """Returns a WasapiSettings object requesting exclusive mode, or None
-    if sounddevice's WASAPI extra settings aren't available in this
-    build."""
     try:
         return sd.WasapiSettings(exclusive=True)
     except Exception:
@@ -120,8 +116,6 @@ class AudioEngine:
         self.input_xruns = 0
         self.output_xruns = 0
 
-        # Diagnostics: whether exclusive mode actually engaged, so the GUI
-        # can show it and we know for certain which path is active.
         self.output_exclusive_mode = False
         self.input_exclusive_mode = False
 
@@ -208,30 +202,29 @@ class AudioEngine:
         return np.clip(out, -1.0, 1.0)
 
     def _open_input_stream(self):
-        """Try WASAPI exclusive mode first (bypasses Windows' shared
-        mixer engine entirely), falling back to normal shared mode if
-        exclusive isn't available."""
         mic_info = self._get_device_info(self.mic_device)
         rate = int(round(mic_info.get("default_samplerate", DEFAULT_SAMPLE_RATE)))
         self.input_channels = max(1, min(2, mic_info.get("max_input_channels", 1)))
 
-        exclusive_settings = _wasapi_exclusive_settings()
-        if exclusive_settings is not None:
-            try:
-                stream = sd.InputStream(
-                    device=self.mic_device,
-                    channels=self.input_channels,
-                    samplerate=rate,
-                    blocksize=BLOCK_SIZE,
-                    dtype="float32",
-                    callback=self._input_callback,
-                    extra_settings=exclusive_settings,
-                )
-                self.input_exclusive_mode = True
-                return stream
-            except Exception:
-                self.input_exclusive_mode = False
+        if USE_EXCLUSIVE_MODE:
+            exclusive_settings = _wasapi_exclusive_settings()
+            if exclusive_settings is not None:
+                try:
+                    stream = sd.InputStream(
+                        device=self.mic_device,
+                        channels=self.input_channels,
+                        samplerate=rate,
+                        blocksize=BLOCK_SIZE,
+                        dtype="float32",
+                        callback=self._input_callback,
+                        extra_settings=exclusive_settings,
+                    )
+                    self.input_exclusive_mode = True
+                    return stream
+                except Exception:
+                    self.input_exclusive_mode = False
 
+        self.input_exclusive_mode = False
         return sd.InputStream(
             device=self.mic_device,
             channels=self.input_channels,
@@ -242,15 +235,12 @@ class AudioEngine:
         )
 
     def _open_output_stream(self):
-        """Try each candidate rate, in EXCLUSIVE mode first (bypasses
-        Windows' shared mixer engine), then shared mode, before moving to
-        the next candidate rate."""
         out_info = self._get_device_info(self.output_device)
         default_rate = int(round(out_info.get("default_samplerate", DEFAULT_SAMPLE_RATE)))
         self.output_channels = max(1, min(2, out_info.get("max_output_channels", 2)))
 
         rates_to_try = [r for r in CANDIDATE_OUTPUT_RATES if r != default_rate] + [default_rate]
-        exclusive_settings = _wasapi_exclusive_settings()
+        exclusive_settings = _wasapi_exclusive_settings() if USE_EXCLUSIVE_MODE else None
 
         last_error = None
         for rate in rates_to_try:
