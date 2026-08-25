@@ -2,21 +2,19 @@
 audio_engine.py
 Real-time audio engine.
 
-Two streams: one InputStream (mic) and one OutputStream (virtual cable),
-with the soundboard mixed directly into the output callback.
-
-GARBAGE COLLECTOR FIX: diagnostics confirmed zero reported xruns/
-underruns from PortAudio/WASAPI even while audio audibly wobbled, and
-neither block size nor latency mode changes fixed it. This points to
-Python's cyclic garbage collector -- it can pause execution for a few
-milliseconds at unpredictable times to run a GC sweep. Inside a real-time
-audio callback that must return within a strict ~20ms window, even a
-brief GC pause causes an audible glitch. Critically, many WASAPI/
-PortAudio shared-mode configurations do NOT reliably report these pauses
-as "xruns", which is exactly why our xrun counters stayed at 0 despite
-audible wobble. Disabling the GC while streaming (and re-enabling +
-forcing a collection on stop) is a standard, well-documented mitigation
-for real-time audio in Python.
+WASAPI EXCLUSIVE MODE FIX: by default, Windows audio streams run in
+"shared mode" -- every app's audio gets funneled through Windows' own
+internal mixer/resampler engine before reaching the device. This shared
+mixer is a well-documented, commonly reported source of exactly this kind
+of intermittent wobble/glitch specifically with VB-Cable, independent of
+anything our own code does (which explains why block size, latency mode,
+resampler quality, threading architecture, and GC pausing fixes never
+fully resolved it -- none of those touch Windows' own shared mixer pass).
+The standard real-world fix is WASAPI Exclusive Mode: our app talks
+DIRECTLY to the driver, completely bypassing the shared mixer. We try
+opening both streams in exclusive mode first, and cleanly fall back to
+normal shared mode if exclusive mode isn't available (e.g. another app
+already has the device open, or the driver doesn't support it).
 """
 
 import gc
@@ -34,8 +32,6 @@ DEFAULT_CHANNELS = 2
 TARGET_LATENCY_SEC = 0.15
 MAX_LATENCY_SEC = 0.6
 
-# Common rates to try, in priority order, before falling back to the
-# device's own reported default. 44100 is the most common file rate.
 CANDIDATE_OUTPUT_RATES = [44100, 48000]
 
 
@@ -44,6 +40,16 @@ def _get_wasapi_hostapi_index():
         if "wasapi" in api["name"].lower():
             return i
     return None
+
+
+def _wasapi_exclusive_settings():
+    """Returns a WasapiSettings object requesting exclusive mode, or None
+    if sounddevice's WASAPI extra settings aren't available in this
+    build."""
+    try:
+        return sd.WasapiSettings(exclusive=True)
+    except Exception:
+        return None
 
 
 class ElasticBuffer:
@@ -113,6 +119,11 @@ class AudioEngine:
 
         self.input_xruns = 0
         self.output_xruns = 0
+
+        # Diagnostics: whether exclusive mode actually engaged, so the GUI
+        # can show it and we know for certain which path is active.
+        self.output_exclusive_mode = False
+        self.input_exclusive_mode = False
 
     @staticmethod
     def list_input_devices():
@@ -196,27 +207,79 @@ class AudioEngine:
             out[over_mask] = sign * compressed
         return np.clip(out, -1.0, 1.0)
 
-    def _open_output_stream(self, device_channels):
-        """Try opening the output stream at each candidate rate in order
-        (44100 first, since that's the most common file rate) before
-        falling back to the device's own reported default. Returns the
-        opened stream, or raises the last error if nothing worked."""
+    def _open_input_stream(self):
+        """Try WASAPI exclusive mode first (bypasses Windows' shared
+        mixer engine entirely), falling back to normal shared mode if
+        exclusive isn't available."""
+        mic_info = self._get_device_info(self.mic_device)
+        rate = int(round(mic_info.get("default_samplerate", DEFAULT_SAMPLE_RATE)))
+        self.input_channels = max(1, min(2, mic_info.get("max_input_channels", 1)))
+
+        exclusive_settings = _wasapi_exclusive_settings()
+        if exclusive_settings is not None:
+            try:
+                stream = sd.InputStream(
+                    device=self.mic_device,
+                    channels=self.input_channels,
+                    samplerate=rate,
+                    blocksize=BLOCK_SIZE,
+                    dtype="float32",
+                    callback=self._input_callback,
+                    extra_settings=exclusive_settings,
+                )
+                self.input_exclusive_mode = True
+                return stream
+            except Exception:
+                self.input_exclusive_mode = False
+
+        return sd.InputStream(
+            device=self.mic_device,
+            channels=self.input_channels,
+            samplerate=rate,
+            blocksize=BLOCK_SIZE,
+            dtype="float32",
+            callback=self._input_callback,
+        )
+
+    def _open_output_stream(self):
+        """Try each candidate rate, in EXCLUSIVE mode first (bypasses
+        Windows' shared mixer engine), then shared mode, before moving to
+        the next candidate rate."""
         out_info = self._get_device_info(self.output_device)
         default_rate = int(round(out_info.get("default_samplerate", DEFAULT_SAMPLE_RATE)))
+        self.output_channels = max(1, min(2, out_info.get("max_output_channels", 2)))
 
         rates_to_try = [r for r in CANDIDATE_OUTPUT_RATES if r != default_rate] + [default_rate]
+        exclusive_settings = _wasapi_exclusive_settings()
 
         last_error = None
         for rate in rates_to_try:
+            if exclusive_settings is not None:
+                try:
+                    stream = sd.OutputStream(
+                        device=self.output_device,
+                        channels=self.output_channels,
+                        samplerate=rate,
+                        blocksize=BLOCK_SIZE,
+                        dtype="float32",
+                        callback=self._output_callback,
+                        extra_settings=exclusive_settings,
+                    )
+                    self.output_exclusive_mode = True
+                    return stream
+                except Exception as e:
+                    last_error = e
+
             try:
                 stream = sd.OutputStream(
                     device=self.output_device,
-                    channels=device_channels,
+                    channels=self.output_channels,
                     samplerate=rate,
                     blocksize=BLOCK_SIZE,
                     dtype="float32",
                     callback=self._output_callback,
                 )
+                self.output_exclusive_mode = False
                 return stream
             except Exception as e:
                 last_error = e
@@ -230,25 +293,11 @@ class AudioEngine:
 
         self.input_xruns = 0
         self.output_xruns = 0
+        self.output_exclusive_mode = False
+        self.input_exclusive_mode = False
 
-        mic_info = self._get_device_info(self.mic_device)
-        out_info = self._get_device_info(self.output_device)
-
-        requested_input_rate = int(round(mic_info.get("default_samplerate", DEFAULT_SAMPLE_RATE)))
-
-        self.input_channels = max(1, min(2, mic_info.get("max_input_channels", 1)))
-        self.output_channels = max(1, min(2, out_info.get("max_output_channels", 2)))
-
-        self._input_stream = sd.InputStream(
-            device=self.mic_device,
-            channels=self.input_channels,
-            samplerate=requested_input_rate,
-            blocksize=BLOCK_SIZE,
-            dtype="float32",
-            callback=self._input_callback,
-        )
-
-        self._output_stream = self._open_output_stream(self.output_channels)
+        self._input_stream = self._open_input_stream()
+        self._output_stream = self._open_output_stream()
 
         self.input_rate = int(round(self._input_stream.samplerate))
         self.output_rate = int(round(self._output_stream.samplerate))
@@ -268,11 +317,6 @@ class AudioEngine:
         self._output_stream.start()
         self._running = True
 
-        # Disable Python's cyclic garbage collector while streaming. GC
-        # pauses (even a few ms) inside a real-time audio callback cause
-        # glitches that many WASAPI/PortAudio shared-mode configurations
-        # do NOT reliably report as "xruns" -- which is why our xrun
-        # counters showed 0 despite audible wobble.
         gc.disable()
 
     def stop(self):
